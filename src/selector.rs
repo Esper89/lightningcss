@@ -32,7 +32,7 @@ mod private {
   pub struct Selectors;
 }
 
-use private::Selectors;
+pub use private::Selectors;
 
 /// A list of selectors.
 pub type SelectorList<'i> = parcel_selectors::SelectorList<'i, Selectors>;
