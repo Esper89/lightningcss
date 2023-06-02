@@ -2,8 +2,8 @@
 
 use crate::error::{ParserError, PrinterError};
 use crate::printer::Printer;
-use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, ToCss, Zero};
+use crate::targets::{Browsers, Targets};
+use crate::traits::{FallbackValues, IsCompatible, Parse, ToCss, Zero};
 use crate::values::color::ColorFallbackKind;
 use crate::values::{angle::Angle, color::CssColor, length::Length, percentage::NumberOrPercentage, url::Url};
 #[cfg(feature = "visitor")]
@@ -209,6 +209,12 @@ impl<'i> Filter<'i> {
   }
 }
 
+impl IsCompatible for Filter<'_> {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
+  }
+}
+
 /// A [`drop-shadow()`](https://drafts.fxtf.org/filter-effects-1/#funcdef-filter-drop-shadow) filter function.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "visitor", derive(Visit))]
@@ -359,7 +365,7 @@ impl<'i> ToCss for FilterList<'i> {
 }
 
 impl<'i> FallbackValues for FilterList<'i> {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     let mut res = Vec::new();
     let mut fallbacks = ColorFallbackKind::empty();
     if let FilterList::Filters(filters) = self {
@@ -395,5 +401,11 @@ impl<'i> FallbackValues for FilterList<'i> {
     }
 
     res
+  }
+}
+
+impl IsCompatible for FilterList<'_> {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
   }
 }

@@ -2,13 +2,14 @@
 
 use crate::compat::Feature;
 use crate::error::{ParserError, PrinterError};
+use crate::parser::ParserFlags;
 use crate::printer::Printer;
 use crate::properties::custom::TokenList;
 use crate::rules::StyleContext;
 use crate::stylesheet::{ParserOptions, PrinterOptions};
-use crate::targets::Browsers;
+use crate::targets::{should_compile, Targets};
 use crate::traits::{Parse, ParseWithOptions, ToCss};
-use crate::values::ident::Ident;
+use crate::values::ident::{CustomIdent, Ident};
 use crate::values::string::CSSString;
 use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
@@ -194,9 +195,11 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
         if !name.starts_with('-') {
           self.options.warn(parser.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name.clone())));
         }
+        let mut args = Vec::new();
+        TokenList::parse_raw(parser, &mut args, &self.options, 0)?;
         CustomFunction {
           name: name.into(),
-          arguments: TokenList::parse(parser, &self.options, 0)?
+          arguments: TokenList(args)
         }
       },
     };
@@ -246,6 +249,8 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
       "-webkit-scrollbar-corner" => WebKitScrollbar(WebKitScrollbarPseudoElement::Corner),
       "-webkit-resizer" => WebKitScrollbar(WebKitScrollbarPseudoElement::Resizer),
 
+      "view-transition" => ViewTransition,
+
       _ => {
         if !name.starts_with('-') {
           self.options.warn(loc.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name.clone())));
@@ -266,11 +271,17 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
     let pseudo_element = match_ignore_ascii_case! { &name,
       "cue" => CueFunction { selector: Box::new(Selector::parse(self, arguments)?) },
       "cue-region" => CueRegionFunction { selector: Box::new(Selector::parse(self, arguments)?) },
+      "view-transition-group" => ViewTransitionGroup { part_name: ViewTransitionPartName::parse(arguments)? },
+      "view-transition-image-pair" => ViewTransitionImagePair { part_name: ViewTransitionPartName::parse(arguments)? },
+      "view-transition-old" => ViewTransitionOld { part_name: ViewTransitionPartName::parse(arguments)? },
+      "view-transition-new" => ViewTransitionNew { part_name: ViewTransitionPartName::parse(arguments)? },
       _ => {
         if !name.starts_with('-') {
           self.options.warn(arguments.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name.clone())));
         }
-        CustomFunction { name: name.into(), arguments: TokenList::parse(arguments, &self.options, 0)? }
+        let mut args = Vec::new();
+        TokenList::parse_raw(arguments, &mut args, &self.options, 0)?;
+        CustomFunction { name: name.into(), arguments: TokenList(args) }
       }
     };
 
@@ -308,6 +319,10 @@ impl<'a, 'o, 'i> parcel_selectors::parser::Parser<'i> for SelectorParser<'a, 'o,
   #[inline]
   fn is_nesting_allowed(&self) -> bool {
     self.is_nesting_allowed
+  }
+
+  fn deep_combinator_enabled(&self) -> bool {
+    self.options.flags.contains(ParserFlags::DEEP_SELECTOR_COMBINATOR)
   }
 }
 
@@ -591,7 +606,7 @@ where
       dest.write_char(':')?;
       // If the printer has a vendor prefix override, use that.
       let vp = if !dest.vendor_prefix.is_empty() {
-        dest.vendor_prefix
+        (dest.vendor_prefix & *$prefix).or_none()
       } else {
         *$prefix
       };
@@ -643,7 +658,7 @@ where
     Fullscreen(prefix) => {
       dest.write_char(':')?;
       let vp = if !dest.vendor_prefix.is_empty() {
-        dest.vendor_prefix
+        (dest.vendor_prefix & *prefix).or_none()
       } else {
         *prefix
       };
@@ -723,7 +738,7 @@ where
       dest.write_char(':')?;
       dest.write_str(name)?;
       dest.write_char('(')?;
-      args.to_css(dest, false)?;
+      args.to_css_raw(dest)?;
       dest.write_char(')')
     }
   }
@@ -751,20 +766,21 @@ impl<'i> PseudoClass<'i> {
     }
   }
 
-  pub(crate) fn get_necessary_prefixes(&self, targets: Browsers) -> VendorPrefix {
+  pub(crate) fn get_necessary_prefixes(&mut self, targets: Targets) -> VendorPrefix {
     use crate::prefixes::Feature;
     use PseudoClass::*;
-    let feature = match self {
-      Fullscreen(p) if *p == VendorPrefix::None => Feature::PseudoClassFullscreen,
-      AnyLink(p) if *p == VendorPrefix::None => Feature::PseudoClassAnyLink,
-      ReadOnly(p) if *p == VendorPrefix::None => Feature::PseudoClassReadOnly,
-      ReadWrite(p) if *p == VendorPrefix::None => Feature::PseudoClassReadWrite,
-      PlaceholderShown(p) if *p == VendorPrefix::None => Feature::PseudoClassPlaceholderShown,
-      Autofill(p) if *p == VendorPrefix::None => Feature::PseudoClassAutofill,
+    let (p, feature) = match self {
+      Fullscreen(p) => (p, Feature::PseudoClassFullscreen),
+      AnyLink(p) => (p, Feature::PseudoClassAnyLink),
+      ReadOnly(p) => (p, Feature::PseudoClassReadOnly),
+      ReadWrite(p) => (p, Feature::PseudoClassReadWrite),
+      PlaceholderShown(p) => (p, Feature::PseudoClassPlaceholderShown),
+      Autofill(p) => (p, Feature::PseudoClassAutofill),
       _ => return VendorPrefix::empty(),
     };
 
-    feature.prefixes_for(targets)
+    *p = targets.prefixes(*p, feature);
+    *p
   }
 }
 
@@ -819,6 +835,32 @@ pub enum PseudoElement<'i> {
     /// The selector argument.
     selector: Box<Selector<'i>>,
   },
+  /// The [::view-transition](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#view-transition) pseudo element.
+  ViewTransition,
+  /// The [::view-transition-group()](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#view-transition-group-pt-name-selector) functional pseudo element.
+  #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+  ViewTransitionGroup {
+    /// A part name selector.
+    part_name: ViewTransitionPartName<'i>,
+  },
+  /// The [::view-transition-image-pair()](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#view-transition-image-pair-pt-name-selector) functional pseudo element.
+  #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+  ViewTransitionImagePair {
+    /// A part name selector.
+    part_name: ViewTransitionPartName<'i>,
+  },
+  /// The [::view-transition-old()](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#view-transition-old-pt-name-selector) functional pseudo element.
+  #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+  ViewTransitionOld {
+    /// A part name selector.
+    part_name: ViewTransitionPartName<'i>,
+  },
+  /// The [::view-transition-new()](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#view-transition-new-pt-name-selector) functional pseudo element.
+  #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+  ViewTransitionNew {
+    /// A part name selector.
+    part_name: ViewTransitionPartName<'i>,
+  },
   /// An unknown pseudo element.
   Custom {
     /// The name of the pseudo element.
@@ -859,6 +901,83 @@ pub enum WebKitScrollbarPseudoElement {
   Resizer,
 }
 
+/// A [view transition part name](https://w3c.github.io/csswg-drafts/css-view-transitions-1/#typedef-pt-name-selector).
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub enum ViewTransitionPartName<'i> {
+  /// *
+  All,
+  /// <custom-ident>
+  Name(CustomIdent<'i>),
+}
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+impl<'i> serde::Serialize for ViewTransitionPartName<'i> {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      ViewTransitionPartName::All => serializer.serialize_str("*"),
+      ViewTransitionPartName::Name(name) => serializer.serialize_str(&name.0),
+    }
+  }
+}
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+impl<'i, 'de: 'i> serde::Deserialize<'de> for ViewTransitionPartName<'i> {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let s = CowArcStr::deserialize(deserializer)?;
+    if s == "*" {
+      Ok(ViewTransitionPartName::All)
+    } else {
+      Ok(ViewTransitionPartName::Name(CustomIdent(s)))
+    }
+  }
+}
+
+#[cfg(feature = "jsonschema")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jsonschema")))]
+impl<'a> schemars::JsonSchema for ViewTransitionPartName<'a> {
+  fn is_referenceable() -> bool {
+    true
+  }
+
+  fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    str::json_schema(gen)
+  }
+
+  fn schema_name() -> String {
+    "ViewTransitionPartName".into()
+  }
+}
+
+impl<'i> Parse<'i> for ViewTransitionPartName<'i> {
+  fn parse<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
+    if input.try_parse(|input| input.expect_delim('*')).is_ok() {
+      return Ok(ViewTransitionPartName::All);
+    }
+
+    Ok(ViewTransitionPartName::Name(CustomIdent::parse(input)?))
+  }
+}
+
+impl<'i> ToCss for ViewTransitionPartName<'i> {
+  fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    match self {
+      ViewTransitionPartName::All => dest.write_char('*'),
+      ViewTransitionPartName::Name(name) => name.to_css(dest),
+    }
+  }
+}
+
 impl<'i> cssparser::ToCss for PseudoElement<'i> {
   fn to_css<W>(&self, _: &mut W) -> std::fmt::Result
   where
@@ -883,7 +1002,7 @@ where
       dest.write_str("::")?;
       // If the printer has a vendor prefix override, use that.
       let vp = if !dest.vendor_prefix.is_empty() {
-        dest.vendor_prefix
+        (dest.vendor_prefix & *$prefix).or_none()
       } else {
         *$prefix
       };
@@ -952,6 +1071,27 @@ where
         Resizer => "::-webkit-resizer",
       })
     }
+    ViewTransition => dest.write_str("::view-transition"),
+    ViewTransitionGroup { part_name } => {
+      dest.write_str("::view-transition-group(")?;
+      part_name.to_css(dest)?;
+      dest.write_char(')')
+    }
+    ViewTransitionImagePair { part_name } => {
+      dest.write_str("::view-transition-image-pair(")?;
+      part_name.to_css(dest)?;
+      dest.write_char(')')
+    }
+    ViewTransitionOld { part_name } => {
+      dest.write_str("::view-transition-old(")?;
+      part_name.to_css(dest)?;
+      dest.write_char(')')
+    }
+    ViewTransitionNew { part_name } => {
+      dest.write_str("::view-transition-new(")?;
+      part_name.to_css(dest)?;
+      dest.write_char(')')
+    }
     Custom { name: val } => {
       dest.write_str("::")?;
       return dest.write_str(val);
@@ -960,7 +1100,7 @@ where
       dest.write_str("::")?;
       dest.write_str(name)?;
       dest.write_char('(')?;
-      args.to_css(dest, false)?;
+      args.to_css_raw(dest)?;
       dest.write_char(')')
     }
   }
@@ -991,6 +1131,23 @@ impl<'i> parcel_selectors::parser::PseudoElement<'i> for PseudoElement<'i> {
   fn is_webkit_scrollbar(&self) -> bool {
     matches!(*self, PseudoElement::WebKitScrollbar(..))
   }
+
+  fn is_view_transition(&self) -> bool {
+    matches!(
+      *self,
+      PseudoElement::ViewTransitionGroup { .. }
+        | PseudoElement::ViewTransitionImagePair { .. }
+        | PseudoElement::ViewTransitionNew { .. }
+        | PseudoElement::ViewTransitionOld { .. }
+    )
+  }
+
+  fn is_unknown(&self) -> bool {
+    matches!(
+      *self,
+      PseudoElement::Custom { .. } | PseudoElement::CustomFunction { .. },
+    )
+  }
 }
 
 impl<'i> PseudoElement<'i> {
@@ -1013,18 +1170,19 @@ impl<'i> PseudoElement<'i> {
     }
   }
 
-  pub(crate) fn get_necessary_prefixes(&self, targets: Browsers) -> VendorPrefix {
+  pub(crate) fn get_necessary_prefixes(&mut self, targets: Targets) -> VendorPrefix {
     use crate::prefixes::Feature;
     use PseudoElement::*;
-    let feature = match self {
-      Selection(p) if *p == VendorPrefix::None => Feature::PseudoElementSelection,
-      Placeholder(p) if *p == VendorPrefix::None => Feature::PseudoElementPlaceholder,
-      Backdrop(p) if *p == VendorPrefix::None => Feature::PseudoElementBackdrop,
-      FileSelectorButton(p) if *p == VendorPrefix::None => Feature::PseudoElementFileSelectorButton,
+    let (p, feature) = match self {
+      Selection(p) => (p, Feature::PseudoElementSelection),
+      Placeholder(p) => (p, Feature::PseudoElementPlaceholder),
+      Backdrop(p) => (p, Feature::PseudoElementBackdrop),
+      FileSelectorButton(p) => (p, Feature::PseudoElementFileSelectorButton),
       _ => return VendorPrefix::empty(),
     };
 
-    feature.prefixes_for(targets)
+    *p = targets.prefixes(*p, feature);
+    *p
   }
 }
 
@@ -1047,6 +1205,12 @@ impl ToCss for Combinator {
       Combinator::Descendant => dest.write_str(" "),
       Combinator::NextSibling => dest.delim('+', true),
       Combinator::LaterSibling => dest.delim('~', true),
+      Combinator::Deep => dest.write_str(" /deep/ "),
+      Combinator::DeepDescendant => {
+        dest.whitespace()?;
+        dest.write_str(">>>")?;
+        dest.whitespace()
+      }
       Combinator::PseudoElement | Combinator::Part | Combinator::SlotAssignment => Ok(()),
     }
   }
@@ -1086,7 +1250,7 @@ where
 
   let mut combinators = selector.iter_raw_match_order().rev().filter_map(|x| x.as_combinator());
   let compound_selectors = selector.iter_raw_match_order().as_slice().split(|x| x.is_combinator()).rev();
-  let supports_nesting = dest.targets.is_none() || Feature::CssNesting.is_compatible(dest.targets.unwrap());
+  let should_compile_nesting = should_compile!(dest.targets, Nesting);
 
   let mut first = true;
   let mut combinators_exhausted = false;
@@ -1144,7 +1308,7 @@ where
           // Iterate over everything so we serialize the namespace
           // too.
           let mut iter = compound.iter();
-          let swap_nesting = has_leading_nesting && !supports_nesting;
+          let swap_nesting = has_leading_nesting && should_compile_nesting;
           if swap_nesting {
             // Swap nesting and type selector (e.g. &div -> div&).
             iter.next();
@@ -1176,7 +1340,7 @@ where
     // following code tries to match.
     if perform_step_2 {
       let mut iter = compound.iter();
-      if has_leading_nesting && !supports_nesting && is_type_selector(compound.get(first_non_namespace)) {
+      if has_leading_nesting && should_compile_nesting && is_type_selector(compound.get(first_non_namespace)) {
         // Swap nesting and type selector (e.g. &div -> div&).
         // This ensures that the compiled selector is valid. e.g. (div.foo is valid, .foodiv is not).
         let nesting = iter.next().unwrap();
@@ -1190,7 +1354,7 @@ where
         }
 
         serialize_component(nesting, dest, context)?;
-      } else if has_leading_nesting && !supports_nesting {
+      } else if has_leading_nesting && should_compile_nesting {
         // Nesting selector may serialize differently if it is leading, due to type selectors.
         iter.next();
         serialize_nesting(dest, context, true)?;
@@ -1373,11 +1537,10 @@ where
   } else {
     // If there is no context, we are at the root if nesting is supported. This is equivalent to :scope.
     // Otherwise, if nesting is supported, serialize the nesting selector directly.
-    let supports_nesting = dest.targets.is_none() || Feature::CssNesting.is_compatible(dest.targets.unwrap());
-    if supports_nesting {
-      dest.write_char('&')
-    } else {
+    if should_compile!(dest.targets, Nesting) {
       dest.write_str(":scope")
+    } else {
+      dest.write_char('&')
     }
   }
 }
@@ -1448,13 +1611,7 @@ where
   W: fmt::Write,
 {
   // Downlevel :not(.a, .b) -> :not(.a):not(.b) if not list is unsupported.
-  let is_supported = if let Some(targets) = dest.targets {
-    Feature::CssNotSelList.is_compatible(targets)
-  } else {
-    true
-  };
-
-  if is_supported {
+  if !should_compile!(dest.targets, NotSelectorList) {
     dest.write_str(":not(")?;
     serialize_selector_list(iter, dest, context, false)?;
     dest.write_char(')')?;
@@ -1469,8 +1626,8 @@ where
   Ok(())
 }
 
-pub(crate) fn is_compatible(selectors: &SelectorList, targets: Option<Browsers>) -> bool {
-  for selector in &selectors.0 {
+pub(crate) fn is_compatible(selectors: &[Selector], targets: Targets) -> bool {
+  for selector in selectors {
     let iter = selector.iter();
     for component in iter {
       let feature = match component {
@@ -1479,67 +1636,85 @@ pub(crate) fn is_compatible(selectors: &SelectorList, targets: Option<Browsers>)
         Component::ExplicitAnyNamespace
         | Component::ExplicitNoNamespace
         | Component::DefaultNamespace(_)
-        | Component::Namespace(_, _) => Feature::CssNamespaces,
+        | Component::Namespace(_, _) => Feature::Namespaces,
 
-        Component::ExplicitUniversalType => Feature::CssSel2,
+        Component::ExplicitUniversalType => Feature::Selectors2,
 
-        Component::AttributeInNoNamespaceExists { .. } => Feature::CssSel2,
+        Component::AttributeInNoNamespaceExists { .. } => Feature::Selectors2,
         Component::AttributeInNoNamespace {
           operator,
           case_sensitivity,
           ..
         } => {
           if *case_sensitivity != ParsedCaseSensitivity::CaseSensitive {
-            Feature::CssCaseInsensitive
+            Feature::CaseInsensitive
           } else {
             match operator {
               AttrSelectorOperator::Equal | AttrSelectorOperator::Includes | AttrSelectorOperator::DashMatch => {
-                Feature::CssSel2
+                Feature::Selectors2
               }
               AttrSelectorOperator::Prefix | AttrSelectorOperator::Substring | AttrSelectorOperator::Suffix => {
-                Feature::CssSel3
+                Feature::Selectors3
               }
             }
           }
         }
         Component::AttributeOther(attr) => match attr.operation {
-          ParsedAttrSelectorOperation::Exists => Feature::CssSel2,
+          ParsedAttrSelectorOperation::Exists => Feature::Selectors2,
           ParsedAttrSelectorOperation::WithValue {
             operator,
             case_sensitivity,
             ..
           } => {
             if case_sensitivity != ParsedCaseSensitivity::CaseSensitive {
-              Feature::CssCaseInsensitive
+              Feature::CaseInsensitive
             } else {
               match operator {
                 AttrSelectorOperator::Equal | AttrSelectorOperator::Includes | AttrSelectorOperator::DashMatch => {
-                  Feature::CssSel2
+                  Feature::Selectors2
                 }
                 AttrSelectorOperator::Prefix | AttrSelectorOperator::Substring | AttrSelectorOperator::Suffix => {
-                  Feature::CssSel3
+                  Feature::Selectors3
                 }
               }
             }
           }
         },
 
-        Component::Empty | Component::Negation(_) | Component::Root => Feature::CssSel3,
+        Component::Empty | Component::Root => Feature::Selectors3,
+        Component::Negation(selectors) => {
+          // :not() selector list is not forgiving.
+          if !targets.is_compatible(Feature::Selectors3) || !is_compatible(&*selectors, targets) {
+            return false;
+          }
+          continue;
+        }
 
         Component::Nth(data) => match data.ty {
-          NthType::Child if data.a == 0 && data.b == 1 => Feature::CssSel2,
+          NthType::Child if data.a == 0 && data.b == 1 => Feature::Selectors2,
           NthType::Col | NthType::LastCol => return false,
-          _ => Feature::CssSel3,
+          _ => Feature::Selectors3,
         },
-        Component::NthOf(..) => Feature::NthChildOf,
+        Component::NthOf(n) => {
+          if !targets.is_compatible(Feature::NthChildOf) || !is_compatible(n.selectors(), targets) {
+            return false;
+          }
+          continue;
+        }
 
-        Component::Is(_) | Component::Nesting => Feature::CssMatchesPseudo,
+        // These support forgiving selector lists, so no need to check nested selectors.
+        Component::Is(_) | Component::Where(_) | Component::Nesting => Feature::IsSelector,
         Component::Any(..) => Feature::AnyPseudo,
-        Component::Has(_) => Feature::CssHas,
+        Component::Has(selectors) => {
+          if !targets.is_compatible(Feature::HasSelector) || !is_compatible(&*selectors, targets) {
+            return false;
+          }
+          continue;
+        }
 
         Component::Scope | Component::Host(_) | Component::Slotted(_) => Feature::Shadowdomv1,
 
-        Component::Part(_) | Component::Where(_) => return false, // TODO: find this data in caniuse-lite
+        Component::Part(_) => return false, // TODO: find this data in caniuse-lite
 
         Component::NonTSPseudoClass(pseudo) => {
           match pseudo {
@@ -1548,33 +1723,33 @@ pub(crate) fn is_compatible(selectors: &SelectorList, targets: Option<Browsers>)
             | PseudoClass::Active
             | PseudoClass::Hover
             | PseudoClass::Focus
-            | PseudoClass::Lang { languages: _ } => Feature::CssSel2,
+            | PseudoClass::Lang { languages: _ } => Feature::Selectors2,
 
             PseudoClass::Checked | PseudoClass::Disabled | PseudoClass::Enabled | PseudoClass::Target => {
-              Feature::CssSel3
+              Feature::Selectors3
             }
 
-            PseudoClass::AnyLink(prefix) if *prefix == VendorPrefix::None => Feature::CssAnyLink,
-            PseudoClass::Indeterminate => Feature::CssIndeterminatePseudo,
+            PseudoClass::AnyLink(prefix) if *prefix == VendorPrefix::None => Feature::AnyLink,
+            PseudoClass::Indeterminate => Feature::IndeterminatePseudo,
 
             PseudoClass::Fullscreen(prefix) if *prefix == VendorPrefix::None => Feature::Fullscreen,
 
-            PseudoClass::FocusVisible => Feature::CssFocusVisible,
-            PseudoClass::FocusWithin => Feature::CssFocusWithin,
-            PseudoClass::Default => Feature::CssDefaultPseudo,
-            PseudoClass::Dir { direction: _ } => Feature::CssDirPseudo,
-            PseudoClass::Optional => Feature::CssOptionalPseudo,
-            PseudoClass::PlaceholderShown(prefix) if *prefix == VendorPrefix::None => Feature::CssPlaceholderShown,
+            PseudoClass::FocusVisible => Feature::FocusVisible,
+            PseudoClass::FocusWithin => Feature::FocusWithin,
+            PseudoClass::Default => Feature::DefaultPseudo,
+            PseudoClass::Dir { direction: _ } => Feature::DirSelector,
+            PseudoClass::Optional => Feature::OptionalPseudo,
+            PseudoClass::PlaceholderShown(prefix) if *prefix == VendorPrefix::None => Feature::PlaceholderShown,
 
             PseudoClass::ReadOnly(prefix) | PseudoClass::ReadWrite(prefix) if *prefix == VendorPrefix::None => {
-              Feature::CssReadOnlyWrite
+              Feature::ReadOnlyWrite
             }
 
             PseudoClass::Valid | PseudoClass::Invalid | PseudoClass::Required => Feature::FormValidation,
 
-            PseudoClass::InRange | PseudoClass::OutOfRange => Feature::CssInOutOfRange,
+            PseudoClass::InRange | PseudoClass::OutOfRange => Feature::InOutOfRange,
 
-            PseudoClass::Autofill(prefix) if *prefix == VendorPrefix::None => Feature::CssAutofill,
+            PseudoClass::Autofill(prefix) if *prefix == VendorPrefix::None => Feature::Autofill,
 
             // Experimental, no browser support.
             PseudoClass::Current
@@ -1599,12 +1774,12 @@ pub(crate) fn is_compatible(selectors: &SelectorList, targets: Option<Browsers>)
         }
 
         Component::PseudoElement(pseudo) => match pseudo {
-          PseudoElement::After | PseudoElement::Before => Feature::CssGencontent,
-          PseudoElement::FirstLine => Feature::CssFirstLine,
-          PseudoElement::FirstLetter => Feature::CssFirstLetter,
-          PseudoElement::Selection(prefix) if *prefix == VendorPrefix::None => Feature::CssSelection,
-          PseudoElement::Placeholder(prefix) if *prefix == VendorPrefix::None => Feature::CssPlaceholder,
-          PseudoElement::Marker => Feature::CssMarkerPseudo,
+          PseudoElement::After | PseudoElement::Before => Feature::Gencontent,
+          PseudoElement::FirstLine => Feature::FirstLine,
+          PseudoElement::FirstLetter => Feature::FirstLetter,
+          PseudoElement::Selection(prefix) if *prefix == VendorPrefix::None => Feature::Selection,
+          PseudoElement::Placeholder(prefix) if *prefix == VendorPrefix::None => Feature::Placeholder,
+          PseudoElement::Marker => Feature::MarkerPseudo,
           PseudoElement::Backdrop(prefix) if *prefix == VendorPrefix::None => Feature::Dialog,
           PseudoElement::Cue => Feature::Cue,
           PseudoElement::CueFunction { selector: _ } => Feature::CueFunction,
@@ -1612,17 +1787,13 @@ pub(crate) fn is_compatible(selectors: &SelectorList, targets: Option<Browsers>)
         },
 
         Component::Combinator(combinator) => match combinator {
-          Combinator::Child | Combinator::NextSibling => Feature::CssSel2,
-          Combinator::LaterSibling => Feature::CssSel3,
+          Combinator::Child | Combinator::NextSibling => Feature::Selectors2,
+          Combinator::LaterSibling => Feature::Selectors3,
           _ => continue,
         },
       };
 
-      if let Some(targets) = targets {
-        if !feature.is_compatible(targets) {
-          return false;
-        }
-      } else {
+      if !targets.is_compatible(feature) {
         return false;
       }
     }
@@ -1680,8 +1851,10 @@ pub(crate) fn get_prefix(selectors: &SelectorList) -> VendorPrefix {
       };
 
       if !p.is_empty() {
-        if prefix.is_empty() || prefix == p {
-          prefix = p;
+        // Allow none to be mixed with a prefix.
+        let prefix_without_none = prefix - VendorPrefix::None;
+        if prefix_without_none.is_empty() || prefix_without_none == p {
+          prefix |= p;
         } else {
           return VendorPrefix::empty();
         }
@@ -1699,7 +1872,7 @@ const RTL_LANGS: &[&str] = &[
 
 /// Downlevels the given selectors to be compatible with the given browser targets.
 /// Returns the necessary vendor prefixes.
-pub(crate) fn downlevel_selectors(selectors: &mut [Selector], targets: Browsers) -> VendorPrefix {
+pub(crate) fn downlevel_selectors(selectors: &mut [Selector], targets: Targets) -> VendorPrefix {
   let mut necessary_prefixes = VendorPrefix::empty();
   for selector in selectors {
     for component in selector.iter_mut_raw_match_order() {
@@ -1710,12 +1883,12 @@ pub(crate) fn downlevel_selectors(selectors: &mut [Selector], targets: Browsers)
   necessary_prefixes
 }
 
-fn downlevel_component<'i>(component: &mut Component<'i>, targets: Browsers) -> VendorPrefix {
+fn downlevel_component<'i>(component: &mut Component<'i>, targets: Targets) -> VendorPrefix {
   match component {
     Component::NonTSPseudoClass(pc) => {
       match pc {
         PseudoClass::Dir { direction: dir } => {
-          if !Feature::CssDirPseudo.is_compatible(targets) {
+          if should_compile!(targets, DirSelector) {
             *component = downlevel_dir(*dir, targets);
             downlevel_component(component, targets)
           } else {
@@ -1725,7 +1898,7 @@ fn downlevel_component<'i>(component: &mut Component<'i>, targets: Browsers) -> 
         PseudoClass::Lang { languages: langs } => {
           // :lang() with multiple languages is not supported everywhere.
           // compile this to :is(:lang(a), :lang(b)) etc.
-          if langs.len() > 1 && !Feature::LangList.is_compatible(targets) {
+          if langs.len() > 1 && should_compile!(targets, LangSelectorList) {
             *component = Component::Is(lang_list_to_selectors(&langs));
             downlevel_component(component, targets)
           } else {
@@ -1741,10 +1914,8 @@ fn downlevel_component<'i>(component: &mut Component<'i>, targets: Browsers) -> 
 
       // Convert :is to :-webkit-any/:-moz-any if needed.
       // All selectors must be simple, no combinators are supported.
-      if !Feature::CssMatchesPseudo.is_compatible(targets)
-        && selectors.iter().all(|selector| !selector.has_combinator())
-      {
-        necessary_prefixes |= crate::prefixes::Feature::AnyPseudo.prefixes_for(targets)
+      if should_compile!(targets, IsSelector) && selectors.iter().all(|selector| !selector.has_combinator()) {
+        necessary_prefixes |= targets.prefixes(VendorPrefix::None, crate::prefixes::Feature::AnyPseudo)
       } else {
         necessary_prefixes |= VendorPrefix::empty()
       }
@@ -1771,11 +1942,11 @@ fn lang_list_to_selectors<'i>(langs: &Vec<CowArcStr<'i>>) -> Box<[Selector<'i>]>
     .into_boxed_slice()
 }
 
-fn downlevel_dir<'i>(dir: Direction, targets: Browsers) -> Component<'i> {
+fn downlevel_dir<'i>(dir: Direction, targets: Targets) -> Component<'i> {
   // Convert :dir to :lang. If supported, use a list of languages in a single :lang,
   // otherwise, use :is/:not, which may be further downleveled to e.g. :-webkit-any.
   let langs = RTL_LANGS.iter().map(|lang| (*lang).into()).collect();
-  if Feature::LangList.is_compatible(targets) {
+  if !should_compile!(targets, LangSelectorList) {
     let c = Component::NonTSPseudoClass(PseudoClass::Lang { languages: langs });
     if dir == Direction::Ltr {
       Component::Negation(vec![Selector::from(c)].into_boxed_slice())
@@ -1867,7 +2038,7 @@ impl<'i> ParseWithOptions<'i> for Selector<'i> {
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     Selector::parse(
       &SelectorParser {
-        is_nesting_allowed: options.nesting,
+        is_nesting_allowed: options.flags.contains(ParserFlags::NESTING),
         options: &options,
       },
       input,
@@ -1882,7 +2053,7 @@ impl<'i> ParseWithOptions<'i> for SelectorList<'i> {
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     SelectorList::parse(
       &SelectorParser {
-        is_nesting_allowed: options.nesting,
+        is_nesting_allowed: options.flags.contains(ParserFlags::NESTING),
         options: &options,
       },
       input,

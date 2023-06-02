@@ -1,6 +1,5 @@
 //! CSS custom properties and unparsed token values.
 
-use crate::compat;
 use crate::error::{ParserError, PrinterError, PrinterErrorKind};
 use crate::macros::enum_property;
 use crate::prefixes::Feature;
@@ -8,7 +7,7 @@ use crate::printer::Printer;
 use crate::properties::PropertyId;
 use crate::rules::supports::SupportsCondition;
 use crate::stylesheet::ParserOptions;
-use crate::targets::Browsers;
+use crate::targets::{should_compile, Targets};
 use crate::traits::{Parse, ParseWithOptions, ToCss};
 use crate::values::angle::Angle;
 use crate::values::color::{
@@ -22,7 +21,6 @@ use crate::values::resolution::Resolution;
 use crate::values::string::CowArcStr;
 use crate::values::time::Time;
 use crate::values::url::Url;
-use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
@@ -157,14 +155,10 @@ impl<'i> UnparsedProperty<'i> {
     Ok(UnparsedProperty { property_id, value })
   }
 
-  pub(crate) fn get_prefixed(&self, targets: Option<Browsers>, feature: Feature) -> UnparsedProperty<'i> {
+  pub(crate) fn get_prefixed(&self, targets: Targets, feature: Feature) -> UnparsedProperty<'i> {
     let mut clone = self.clone();
     let prefix = self.property_id.prefix();
-    if prefix.is_empty() || prefix.contains(VendorPrefix::None) {
-      if let Some(targets) = targets {
-        clone.property_id = clone.property_id.with_prefix(feature.prefixes_for(targets))
-      }
-    }
+    clone.property_id = clone.property_id.with_prefix(targets.prefixes(prefix.or_none(), feature));
     clone
   }
 
@@ -312,6 +306,54 @@ impl<'i> TokenList<'i> {
     return Ok(TokenList(tokens));
   }
 
+  pub(crate) fn parse_raw<'t>(
+    input: &mut Parser<'i, 't>,
+    tokens: &mut Vec<TokenOrValue<'i>>,
+    options: &ParserOptions<'_, 'i>,
+    depth: usize,
+  ) -> Result<(), ParseError<'i, ParserError<'i>>> {
+    if depth > 500 {
+      return Err(input.new_custom_error(ParserError::MaximumNestingDepth));
+    }
+
+    loop {
+      let state = input.state();
+      match input.next_including_whitespace_and_comments() {
+        Ok(token @ &cssparser::Token::ParenthesisBlock)
+        | Ok(token @ &cssparser::Token::SquareBracketBlock)
+        | Ok(token @ &cssparser::Token::CurlyBracketBlock) => {
+          tokens.push(Token::from(token).into());
+          let closing_delimiter = match token {
+            cssparser::Token::ParenthesisBlock => Token::CloseParenthesis,
+            cssparser::Token::SquareBracketBlock => Token::CloseSquareBracket,
+            cssparser::Token::CurlyBracketBlock => Token::CloseCurlyBracket,
+            _ => unreachable!(),
+          };
+
+          input.parse_nested_block(|input| TokenList::parse_raw(input, tokens, options, depth + 1))?;
+          tokens.push(closing_delimiter.into());
+        }
+        Ok(token @ &cssparser::Token::Function(_)) => {
+          tokens.push(Token::from(token).into());
+          input.parse_nested_block(|input| TokenList::parse_raw(input, tokens, options, depth + 1))?;
+          tokens.push(Token::CloseParenthesis.into());
+        }
+        Ok(token) if token.is_parse_error() => {
+          return Err(ParseError {
+            kind: ParseErrorKind::Basic(BasicParseErrorKind::UnexpectedToken(token.clone())),
+            location: state.source_location(),
+          })
+        }
+        Ok(token) => {
+          tokens.push(Token::from(token).into());
+        }
+        Err(_) => break,
+      }
+    }
+
+    Ok(())
+  }
+
   fn parse_into<'t>(
     input: &mut Parser<'i, 't>,
     tokens: &mut Vec<TokenOrValue<'i>>,
@@ -429,6 +471,12 @@ impl<'i> TokenList<'i> {
           tokens.push(value);
           last_is_delim = false;
           last_is_whitespace = false;
+        }
+        Ok(token) if token.is_parse_error() => {
+          return Err(ParseError {
+            kind: ParseErrorKind::Basic(BasicParseErrorKind::UnexpectedToken(token.clone())),
+            location: state.source_location(),
+          })
         }
         Ok(token) => {
           last_is_delim = matches!(token, cssparser::Token::Delim(_) | cssparser::Token::Comma);
@@ -573,6 +621,27 @@ impl<'i> TokenList<'i> {
           }
         },
       };
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn to_css_raw<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    for token_or_value in &self.0 {
+      match token_or_value {
+        TokenOrValue::Token(token) => {
+          token.to_css(dest)?;
+        }
+        _ => {
+          return Err(PrinterError {
+            kind: PrinterErrorKind::FmtError,
+            loc: None,
+          })
+        }
+      }
     }
 
     Ok(())
@@ -1016,7 +1085,7 @@ fn integer_decode(v: f32) -> (u32, i16, i8) {
 }
 
 impl<'i> TokenList<'i> {
-  pub(crate) fn get_necessary_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  pub(crate) fn get_necessary_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     let mut fallbacks = ColorFallbackKind::empty();
     for token in &self.0 {
       match token {
@@ -1058,7 +1127,7 @@ impl<'i> TokenList<'i> {
     TokenList(tokens)
   }
 
-  pub(crate) fn get_fallbacks(&mut self, targets: Browsers) -> Vec<(SupportsCondition<'i>, Self)> {
+  pub(crate) fn get_fallbacks(&mut self, targets: Targets) -> Vec<(SupportsCondition<'i>, Self)> {
     // Get the full list of possible fallbacks, and remove the lowest one, which will replace
     // the original declaration. The remaining fallbacks need to be added as @supports rules.
     let mut fallbacks = self.get_necessary_fallbacks(targets);
@@ -1486,19 +1555,17 @@ impl<'i> UnresolvedColor<'i> {
 
     match self {
       UnresolvedColor::RGB { r, g, b, alpha } => {
-        if let Some(targets) = dest.targets {
-          if !compat::Feature::SpaceSeparatedColorFunction.is_compatible(targets) {
-            dest.write_str("rgba(")?;
-            c(r).to_css(dest)?;
-            dest.delim(',', false)?;
-            c(g).to_css(dest)?;
-            dest.delim(',', false)?;
-            c(b).to_css(dest)?;
-            dest.delim(',', false)?;
-            alpha.to_css(dest, is_custom_property)?;
-            dest.write_char(')')?;
-            return Ok(());
-          }
+        if should_compile!(dest.targets, SpaceSeparatedColorNotation) {
+          dest.write_str("rgba(")?;
+          c(r).to_css(dest)?;
+          dest.delim(',', false)?;
+          c(g).to_css(dest)?;
+          dest.delim(',', false)?;
+          c(b).to_css(dest)?;
+          dest.delim(',', false)?;
+          alpha.to_css(dest, is_custom_property)?;
+          dest.write_char(')')?;
+          return Ok(());
         }
 
         dest.write_str("rgb(")?;
@@ -1512,19 +1579,17 @@ impl<'i> UnresolvedColor<'i> {
         dest.write_char(')')
       }
       UnresolvedColor::HSL { h, s, l, alpha } => {
-        if let Some(targets) = dest.targets {
-          if !compat::Feature::SpaceSeparatedColorFunction.is_compatible(targets) {
-            dest.write_str("hsla(")?;
-            h.to_css(dest)?;
-            dest.delim(',', false)?;
-            Percentage(*s).to_css(dest)?;
-            dest.delim(',', false)?;
-            Percentage(*l).to_css(dest)?;
-            dest.delim(',', false)?;
-            alpha.to_css(dest, is_custom_property)?;
-            dest.write_char(')')?;
-            return Ok(());
-          }
+        if should_compile!(dest.targets, SpaceSeparatedColorNotation) {
+          dest.write_str("hsla(")?;
+          h.to_css(dest)?;
+          dest.delim(',', false)?;
+          Percentage(*s).to_css(dest)?;
+          dest.delim(',', false)?;
+          Percentage(*l).to_css(dest)?;
+          dest.delim(',', false)?;
+          alpha.to_css(dest, is_custom_property)?;
+          dest.write_char(')')?;
+          return Ok(());
         }
 
         dest.write_str("hsl(")?;

@@ -41,7 +41,7 @@ test('different types', () => {
     ])
   });
 
-  assert.equal(res.code.toString(), '.foo{width:1rem;color:#0f0}');
+  assert.equal(res.code.toString(), '.foo{color:#0f0;width:1rem}');
 });
 
 test('simple matching types', () => {
@@ -510,6 +510,9 @@ test('known rules', () => {
         margin-right: @margin-left;
       }
     `),
+    targets: {
+      safari: 14 << 16
+    },
     visitor: composeVisitors([
       {
         Rule: {
@@ -616,7 +619,7 @@ test('environment variables', () => {
     ])
   });
 
-  assert.equal(res.code.toString(), '@media (max-width:600px){body{padding:20px}}');
+  assert.equal(res.code.toString(), '@media (width<=600px){body{padding:20px}}');
 });
 
 test('variables', () => {

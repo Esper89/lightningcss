@@ -127,13 +127,13 @@ use crate::parser::starts_with_ignore_ascii_case;
 use crate::parser::ParserOptions;
 use crate::prefixes::Feature;
 use crate::printer::{Printer, PrinterOptions};
-use crate::targets::Browsers;
+use crate::targets::{Targets};
 use crate::traits::{Parse, ParseWithOptions, Shorthand, ToCss};
 use crate::values::number::{CSSInteger, CSSNumber};
 use crate::values::string::CowArcStr;
 use crate::values::{
-  alpha::*, color::*, easing::EasingFunction, ident::DashedIdentReference, image::*, length::*, position::*,
-  rect::*, shape::FillRule, size::Size2D, time::Time,
+  alpha::*, color::*, easing::EasingFunction, ident::CustomIdent, ident::DashedIdentReference, image::*,
+  length::*, position::*, rect::*, shape::FillRule, size::Size2D, time::Time,
 };
 use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
@@ -342,7 +342,7 @@ macro_rules! define_properties {
         }
       }
 
-      pub(crate) fn set_prefixes_for_targets(&mut self, targets: Browsers) {
+      pub(crate) fn set_prefixes_for_targets(&mut self, targets: Targets) {
         match self {
           $(
             $(#[$meta])*
@@ -351,9 +351,7 @@ macro_rules! define_properties {
               macro_rules! get_prefixed {
                 ($v: ty, $u: literal) => {};
                 ($v: ty) => {{
-                  if prefix.contains(VendorPrefix::None) {
-                    *prefix = Feature::$property.prefixes_for(targets);
-                  };
+                  *prefix = targets.prefixes(*prefix, Feature::$property);
                 }};
                 () => {};
               }
@@ -1489,6 +1487,9 @@ define_properties! {
   "text-emphasis-position": TextEmphasisPosition(TextEmphasisPosition, VendorPrefix) / WebKit,
   "text-shadow": TextShadow(SmallVec<[TextShadow; 1]>),
 
+  // https://w3c.github.io/csswg-drafts/css-size-adjust/
+  "text-size-adjust": TextSizeAdjust(TextSizeAdjust, VendorPrefix) / WebKit / Moz / Ms,
+
   // https://www.w3.org/TR/css-break-3/
   "box-decoration-break": BoxDecorationBreak(BoxDecorationBreak, VendorPrefix) / WebKit,
 
@@ -1579,6 +1580,9 @@ define_properties! {
   "container-type": ContainerType(ContainerType),
   "container-name": ContainerName(ContainerNameList<'i>),
   "container": Container(Container<'i>) shorthand: true,
+
+  // https://w3c.github.io/csswg-drafts/css-view-transitions-1/
+  "view-transition-name": ViewTransitionName(CustomIdent<'i>),
 }
 
 impl<'i, T: smallvec::Array<Item = V>, V: Parse<'i>> Parse<'i> for SmallVec<T> {

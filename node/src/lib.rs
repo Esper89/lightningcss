@@ -8,9 +8,9 @@ use lightningcss::css_modules::{CssModuleExports, CssModuleReferences, PatternPa
 use lightningcss::dependencies::{Dependency, DependencyOptions};
 use lightningcss::error::{Error, ErrorLocation, MinifyErrorKind, ParserError, PrinterErrorKind};
 use lightningcss::stylesheet::{
-  MinifyOptions, ParserOptions, PrinterOptions, PseudoClasses, StyleAttribute, StyleSheet,
+  MinifyOptions, ParserFlags, ParserOptions, PrinterOptions, PseudoClasses, StyleAttribute, StyleSheet,
 };
-use lightningcss::targets::Browsers;
+use lightningcss::targets::{Browsers, Features, Targets};
 use lightningcss::visitor::Visit;
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
@@ -492,10 +492,15 @@ struct Config {
   #[serde(with = "serde_bytes")]
   pub code: Vec<u8>,
   pub targets: Option<Browsers>,
+  #[serde(default)]
+  pub include: u32,
+  #[serde(default)]
+  pub exclude: u32,
   pub minify: Option<bool>,
   pub source_map: Option<bool>,
   pub input_source_map: Option<String>,
   pub drafts: Option<Drafts>,
+  pub non_standard: Option<NonStandard>,
   pub css_modules: Option<CssModulesOption>,
   pub analyze_dependencies: Option<AnalyzeDependenciesOption>,
   pub pseudo_classes: Option<OwnedPseudoClasses>,
@@ -537,9 +542,14 @@ struct BundleConfig {
   pub filename: String,
   pub project_root: Option<String>,
   pub targets: Option<Browsers>,
+  #[serde(default)]
+  pub include: u32,
+  #[serde(default)]
+  pub exclude: u32,
   pub minify: Option<bool>,
   pub source_map: Option<bool>,
   pub drafts: Option<Drafts>,
+  pub non_standard: Option<NonStandard>,
   pub css_modules: Option<CssModulesOption>,
   pub analyze_dependencies: Option<AnalyzeDependenciesOption>,
   pub pseudo_classes: Option<OwnedPseudoClasses>,
@@ -579,12 +589,20 @@ struct Drafts {
   custom_media: bool,
 }
 
+#[derive(Serialize, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NonStandard {
+  #[serde(default)]
+  deep_selector_combinator: bool,
+}
+
 fn compile<'i>(
   code: &'i str,
   config: &Config,
   visitor: &mut Option<JsVisitor>,
 ) -> Result<TransformResult<'i>, CompileError<'i, std::io::Error>> {
   let drafts = config.drafts.as_ref();
+  let non_standard = config.non_standard.as_ref();
   let warnings = Some(Arc::new(RwLock::new(Vec::new())));
 
   let filename = config.filename.clone().unwrap_or_default();
@@ -599,12 +617,19 @@ fn compile<'i>(
   };
 
   let res = {
+    let mut flags = ParserFlags::empty();
+    flags.set(ParserFlags::NESTING, matches!(drafts, Some(d) if d.nesting));
+    flags.set(ParserFlags::CUSTOM_MEDIA, matches!(drafts, Some(d) if d.custom_media));
+    flags.set(
+      ParserFlags::DEEP_SELECTOR_COMBINATOR,
+      matches!(non_standard, Some(v) if v.deep_selector_combinator),
+    );
+
     let mut stylesheet = StyleSheet::parse_with(
       &code,
       ParserOptions {
         filename: filename.clone(),
-        nesting: matches!(drafts, Some(d) if d.nesting),
-        custom_media: matches!(drafts, Some(d) if d.custom_media),
+        flags,
         css_modules: if let Some(css_modules) = &config.css_modules {
           match css_modules {
             CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
@@ -637,8 +662,14 @@ fn compile<'i>(
       stylesheet.visit(visitor).map_err(CompileError::JsError)?;
     }
 
+    let targets = Targets {
+      browsers: config.targets,
+      include: Features::from_bits_truncate(config.include),
+      exclude: Features::from_bits_truncate(config.exclude),
+    };
+
     stylesheet.minify(MinifyOptions {
-      targets: config.targets,
+      targets,
       unused_symbols: config.unused_symbols.clone().unwrap_or_default(),
     })?;
 
@@ -646,7 +677,7 @@ fn compile<'i>(
       minify: config.minify.unwrap_or_default(),
       source_map: source_map.as_mut(),
       project_root,
-      targets: config.targets,
+      targets,
       analyze_dependencies: if let Some(d) = &config.analyze_dependencies {
         match d {
           AnalyzeDependenciesOption::Bool(b) if *b => Some(DependencyOptions { remove_imports: true }),
@@ -709,11 +740,20 @@ fn compile_bundle<
     None
   };
   let warnings = Some(Arc::new(RwLock::new(Vec::new())));
+
   let res = {
     let drafts = config.drafts.as_ref();
+    let non_standard = config.non_standard.as_ref();
+    let mut flags = ParserFlags::empty();
+    flags.set(ParserFlags::NESTING, matches!(drafts, Some(d) if d.nesting));
+    flags.set(ParserFlags::CUSTOM_MEDIA, matches!(drafts, Some(d) if d.custom_media));
+    flags.set(
+      ParserFlags::DEEP_SELECTOR_COMBINATOR,
+      matches!(non_standard, Some(v) if v.deep_selector_combinator),
+    );
+
     let parser_options = ParserOptions {
-      nesting: matches!(drafts, Some(d) if d.nesting),
-      custom_media: matches!(drafts, Some(d) if d.custom_media),
+      flags,
       css_modules: if let Some(css_modules) = &config.css_modules {
         match css_modules {
           CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
@@ -751,8 +791,14 @@ fn compile_bundle<
       visit(&mut stylesheet).map_err(CompileError::JsError)?;
     }
 
+    let targets = Targets {
+      browsers: config.targets,
+      include: Features::from_bits_truncate(config.include),
+      exclude: Features::from_bits_truncate(config.exclude),
+    };
+
     stylesheet.minify(MinifyOptions {
-      targets: config.targets,
+      targets,
       unused_symbols: config.unused_symbols.clone().unwrap_or_default(),
     })?;
 
@@ -760,7 +806,7 @@ fn compile_bundle<
       minify: config.minify.unwrap_or_default(),
       source_map: source_map.as_mut(),
       project_root,
-      targets: config.targets,
+      targets,
       analyze_dependencies: if let Some(d) = &config.analyze_dependencies {
         match d {
           AnalyzeDependenciesOption::Bool(b) if *b => Some(DependencyOptions { remove_imports: true }),
@@ -807,6 +853,10 @@ struct AttrConfig {
   #[serde(with = "serde_bytes")]
   pub code: Vec<u8>,
   pub targets: Option<Browsers>,
+  #[serde(default)]
+  pub include: u32,
+  #[serde(default)]
+  pub exclude: u32,
   #[serde(default)]
   pub minify: bool,
   #[serde(default)]
@@ -863,15 +913,21 @@ fn compile_attr<'i>(
       attr.visit(visitor).unwrap();
     }
 
+    let targets = Targets {
+      browsers: config.targets,
+      include: Features::from_bits_truncate(config.include),
+      exclude: Features::from_bits_truncate(config.exclude),
+    };
+
     attr.minify(MinifyOptions {
-      targets: config.targets,
+      targets,
       ..MinifyOptions::default()
     });
     attr.to_css(PrinterOptions {
       minify: config.minify,
       source_map: None,
       project_root: None,
-      targets: config.targets,
+      targets,
       analyze_dependencies: if config.analyze_dependencies {
         Some(DependencyOptions::default())
       } else {

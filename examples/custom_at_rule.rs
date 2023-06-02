@@ -8,7 +8,7 @@ use lightningcss::{
   properties::custom::{Token, TokenOrValue},
   rules::{style::StyleRule, CssRule, CssRuleList, Location},
   selector::{Component, Selector},
-  stylesheet::{ParserOptions, PrinterOptions, StyleSheet},
+  stylesheet::{ParserFlags, ParserOptions, PrinterOptions, StyleSheet},
   targets::Browsers,
   traits::{AtRuleParser, ToCss},
   values::{color::CssColor, length::LengthValue},
@@ -22,6 +22,7 @@ fn main() {
   let source = std::fs::read_to_string(&args[1]).unwrap();
   let opts = ParserOptions {
     filename: args[1].clone(),
+    flags: ParserFlags::NESTING,
     ..Default::default()
   };
 
@@ -40,10 +41,11 @@ fn main() {
 
   let result = stylesheet
     .to_css(PrinterOptions {
-      targets: Some(Browsers {
+      targets: Browsers {
         chrome: Some(100 << 16),
         ..Browsers::default()
-      }),
+      }
+      .into(),
       ..PrinterOptions::default()
     })
     .unwrap();
@@ -191,7 +193,9 @@ impl<'a, 'i> Visitor<'i, AtRule> for ApplyVisitor<'a, 'i> {
     if let CssRule::Custom(AtRule::Apply(apply)) = rule {
       let mut declarations = DeclarationBlock::new();
       for name in &apply.names {
-        let applied = self.rules.get(name).unwrap();
+        let Some(applied) = self.rules.get(name) else {
+          continue;
+        };
         declarations
           .important_declarations
           .extend(applied.important_declarations.iter().cloned());

@@ -32,7 +32,7 @@ const MDN_BROWSER_MAPPING = {
 
 const latestBrowserVersions = {};
 for (let b in browsers) {
-  let versions = browsers[b].versions.slice(10);
+  let versions = browsers[b].versions.slice(-10);
   for (let i = versions.length - 1; i >= 0; i--) {
     if (versions[i] != null && versions[i] != "all" && versions[i] != "TP") {
       latestBrowserVersions[b] = versions[i];
@@ -87,8 +87,9 @@ for (let prop in prefixes) {
       prefix = 'webkit';
     }
 
-    name = BROWSER_MAPPING[name] || name;
+    let origName = name;
     let isCurrentVersion = version === latestBrowserVersions[name];
+    name = BROWSER_MAPPING[name] || name;
     let v = parseVersion(version);
     if (v == null) {
       console.log('BAD VERSION', prop, name, version);
@@ -96,13 +97,15 @@ for (let prop in prefixes) {
     }
     if (browserMap[name]?.[prefix] == null) {
       browserMap[name] = browserMap[name] || {};
-      browserMap[name][prefix] = isCurrentVersion ? [v, null] : [v, v];
+      browserMap[name][prefix] = prefixes[prop].browsers.filter(b => b.startsWith(origName) || b.startsWith(name)).length === 1
+        ? isCurrentVersion ? [null, null] : [null, v]
+        : isCurrentVersion ? [v, null] : [v, v];
     } else {
       if (v < browserMap[name][prefix][0]) {
         browserMap[name][prefix][0] = v;
       }
 
-      if (isCurrentVersion) {
+      if (isCurrentVersion && browserMap[name][prefix][0] != null) {
         browserMap[name][prefix][1] = null;
       } else if (v > browserMap[name][prefix][1] && browserMap[name][prefix][1] != null) {
         browserMap[name][prefix][1] = v;
@@ -137,6 +140,7 @@ for (let prop in prefixes) {
   }
   addValue(p, browserMap, prop);
 }
+
 
 function addValue(map, value, prop) {
   let s = JSON.stringify(value);
@@ -184,8 +188,21 @@ let cssFeatures = [
   'css-nesting',
   'css-not-sel-list',
   'css-has',
-  'font-family-system-ui'
+  'font-family-system-ui',
+  'extended-system-fonts',
+  'calc'
 ];
+
+let cssFeatureMappings = {
+  'css-dir-pseudo': 'DirSelector',
+  'css-rrggbbaa': 'HexAlphaColors',
+  'css-not-sel-list': 'NotSelectorList',
+  'css-has': 'HasSelector',
+  'css-matches-pseudo': 'IsSelector',
+  'css-sel2': 'Selectors2',
+  'css-sel3': 'Selectors3',
+  'calc': 'CalcFunction'
+};
 
 let compat = new Map();
 for (let feature of cssFeatures) {
@@ -212,7 +229,8 @@ for (let feature of cssFeatures) {
     }
   }
 
-  addValue(compat, browserMap, feature);
+  let name = (cssFeatureMappings[feature] || feature).replace(/^css-/, '');
+  addValue(compat, browserMap, name);
 }
 
 // No browser supports custom media queries yet.
@@ -220,7 +238,7 @@ addValue(compat, {}, 'custom-media-queries');
 
 let mdnFeatures = {
   doublePositionGradients: mdn.css.types.image.gradient['radial-gradient'].doubleposition.__compat.support,
-  clamp: mdn.css.types.clamp.__compat.support,
+  clampFunction: mdn.css.types.clamp.__compat.support,
   placeSelf: mdn.css.properties['place-self'].__compat.support,
   placeContent: mdn.css.properties['place-content'].__compat.support,
   placeItems: mdn.css.properties['place-items'].__compat.support,
@@ -252,7 +270,7 @@ let mdnFeatures = {
   labColors: mdn.css.types.color.lab.__compat.support,
   oklabColors: mdn.css.types.color.oklab.__compat.support,
   colorFunction: mdn.css.types.color.color.__compat.support,
-  spaceSeparatedColorFunction: mdn.css.types.color.rgb.space_separated_parameters.__compat.support,
+  spaceSeparatedColorNotation: mdn.css.types.color.rgb.space_separated_parameters.__compat.support,
   textDecorationThicknessPercent: mdn.css.properties['text-decoration-thickness'].percentage.__compat.support,
   textDecorationThicknessShorthand: mdn.css.properties['text-decoration']['text-decoration-thickness'].__compat.support,
   cue: mdn.css.selectors.cue.__compat.support,
@@ -276,7 +294,76 @@ let mdnFeatures = {
   imageSet: mdn.css.types.image['image-set'].__compat.support,
   xResolutionUnit: mdn.css.types.resolution.x.__compat.support,
   nthChildOf: mdn.css.selectors['nth-child'].of_syntax.__compat.support,
+  minFunction: mdn.css.types.min.__compat.support,
+  maxFunction: mdn.css.types.max.__compat.support,
+  roundFunction: mdn.css.types.round.__compat.support,
+  remFunction: mdn.css.types.rem.__compat.support,
+  modFunction: mdn.css.types.mod.__compat.support,
+  absFunction: mdn.css.types.abs.__compat.support,
+  signFunction: mdn.css.types.sign.__compat.support,
+  hypotFunction: mdn.css.types.hypot.__compat.support,
+  gradientInterpolationHints: mdn.css.types.image.gradient['linear-gradient'].interpolation_hints.__compat.support,
+  borderImageRepeatRound: mdn.css.properties['border-image-repeat'].round.__compat.support,
+  borderImageRepeatSpace: mdn.css.properties['border-image-repeat'].space.__compat.support,
+  fontSizeRem: mdn.css.properties['font-size'].rem_values.__compat.support,
+  fontSizeXXXLarge: mdn.css.properties['font-size']['xxx-large'].__compat.support,
+  fontStyleObliqueAngle: mdn.css.properties['font-style']['oblique-angle'].__compat.support,
+  fontWeightNumber: mdn.css.properties['font-weight'].number.__compat.support,
+  fontStretchPercentage: mdn.css.properties['font-stretch'].percentage.__compat.support,
 };
+
+for (let key in mdn.css.types.length) {
+  if (key === '__compat') {
+    continue;
+  }
+
+  let feat = key.includes('_')
+    ? key.replace(/_([a-z])/g, (_, l) => l.toUpperCase())
+    : key + 'Unit';
+
+  mdnFeatures[feat] = mdn.css.types.length[key].__compat.support;
+}
+
+for (let key in mdn.css.types.image.gradient) {
+  if (key === '__compat') {
+    continue;
+  }
+
+  let feat = key.replace(/-([a-z])/g, (_, l) => l.toUpperCase());
+  mdnFeatures[feat] = mdn.css.types.image.gradient[key].__compat.support;
+}
+
+const nonStandardListStyleType = new Set([
+  // https://developer.mozilla.org/en-US/docs/Web/CSS/list-style-type#non-standard_extensions
+  'ethiopic-halehame',
+  'ethiopic-halehame-am',
+  'ethiopic-halehame-ti-er',
+  'ethiopic-halehame-ti-et',
+  'hangul',
+  'hangul-consonant',
+  'urdu',
+  'cjk-ideographic',
+  // https://github.com/w3c/csswg-drafts/issues/135
+  'upper-greek'
+]);
+
+for (let key in mdn.css.properties['list-style-type']) {
+  if (key === '__compat' || nonStandardListStyleType.has(key) || mdn.css.properties['list-style-type'][key].__compat.support.chrome.version_removed) {
+    continue;
+  }
+
+  let feat = key[0].toUpperCase() + key.slice(1).replace(/-([a-z])/g, (_, l) => l.toUpperCase()) + 'ListStyleType';
+  mdnFeatures[feat] = mdn.css.properties['list-style-type'][key].__compat.support;
+}
+
+for (let key in mdn.css.properties['width']) {
+  if (key === '__compat' || key === 'animatable') {
+    continue;
+  }
+
+  let feat = key[0].toUpperCase() + key.slice(1).replace(/[-_]([a-z])/g, (_, l) => l.toUpperCase()) + 'Size';
+  mdnFeatures[feat] = mdn.css.properties['width'][key].__compat.support;
+}
 
 for (let feature in mdnFeatures) {
   let browserMap = {};
@@ -319,7 +406,7 @@ addValue(compat, {
   // https://github.com/WebKit/WebKit/commit/baed0d8b0abf366e1d9a6105dc378c59a5f21575
   safari: parseVersion('10.1'),
   ios_saf: parseVersion('10.3')
-}, 'langList');
+}, 'LangSelectorList');
 
 let prefixMapping = {
   webkit: 'WebKit',
@@ -328,13 +415,50 @@ let prefixMapping = {
   o: 'O'
 };
 
+let flags = [
+  'Nesting',
+  'NotSelectorList',
+  'DirSelector',
+  'LangSelectorList',
+  'IsSelector',
+  'TextDecorationThicknessPercent',
+  'MediaIntervalSyntax',
+  'MediaRangeSyntax',
+  'CustomMediaQueries',
+  'ClampFunction',
+  'ColorFunction',
+  'OklabColors',
+  'LabColors',
+  'P3Colors',
+  'HexAlphaColors',
+  'SpaceSeparatedColorNotation',
+  'FontFamilySystemUi',
+  'DoublePositionGradients',
+  'VendorPrefixes',
+  'LogicalProperties',
+  ['Selectors', ['Nesting', 'NotSelectorList', 'DirSelector', 'LangSelectorList', 'IsSelector']],
+  ['MediaQueries', ['MediaIntervalSyntax', 'MediaRangeSyntax', 'CustomMediaQueries']],
+  ['Colors', ['ColorFunction', 'OklabColors', 'LabColors', 'P3Colors', 'HexAlphaColors', 'SpaceSeparatedColorNotation']],
+];
+
 let enumify = (f) => f.replace(/^@([a-z])/, (_, x) => 'At' + x.toUpperCase()).replace(/^::([a-z])/, (_, x) => 'PseudoElement' + x.toUpperCase()).replace(/^:([a-z])/, (_, x) => 'PseudoClass' + x.toUpperCase()).replace(/(^|-)([a-z])/g, (_, a, x) => x.toUpperCase())
 
 let allBrowsers = Object.keys(browsers).filter(b => !(b in BROWSER_MAPPING)).sort();
-let targets = fs.readFileSync('src/targets.rs', 'utf8')
-  .replace(/pub struct Browsers \{((?:.|\n)+?)\}/, `pub struct Browsers {
+let browsersRs = `pub struct Browsers {
   pub ${allBrowsers.join(': Option<u32>,\n  pub ')}: Option<u32>
-}`);
+}`;
+let flagsRs = `pub struct Features: u32 {
+    ${flags.map((flag, i) => {
+      if (Array.isArray(flag)) {
+        return `const ${flag[0]} = ${flag[1].map(f => `Self::${f}.bits()`).join(' | ')};`
+      } else {
+        return `const ${flag} = 1 << ${i};`;
+      }
+    }).join('\n    ')}
+  }`;
+let targets = fs.readFileSync('src/targets.rs', 'utf8')
+  .replace(/pub struct Browsers \{((?:.|\n)+?)\}/, browsersRs)
+  .replace(/pub struct Features: u32 \{((?:.|\n)+?)\}/, flagsRs);
 
 fs.writeFileSync('src/targets.rs', targets);
 execSync('rustfmt src/targets.rs');
@@ -344,9 +468,34 @@ let targets_dts = `// This file is autogenerated by build-prefixes.js. DO NOT ED
 export interface Targets {
   ${allBrowsers.join('?: number,\n  ')}?: number
 }
+
+export declare const enum Features {
+  ${flags.map((flag, i) => {
+    if (Array.isArray(flag)) {
+      return `${flag[0]} = ${flag[1].reduce((p, f) => p | (1 << flags.indexOf(f)), 0)},`
+    } else {
+      return `${flag} = ${1 << i},`;
+    }
+  }).join('\n  ')}
+}
 `;
 
 fs.writeFileSync('node/targets.d.ts', targets_dts);
+
+let flagsJs = `// This file is autogenerated by build-prefixes.js. DO NOT EDIT!
+
+exports.Features = {
+  ${flags.map((flag, i) => {
+    if (Array.isArray(flag)) {
+      return `${flag[0]}: ${flag[1].reduce((p, f) => p | (1 << flags.indexOf(f)), 0)},`
+    } else {
+      return `${flag}: ${1 << i},`;
+    }
+  }).join('\n  ')}
+};
+`;
+
+fs.writeFileSync('node/flags.js', flagsJs);
 
 let s = `// This file is autogenerated by build-prefixes.js. DO NOT EDIT!
 
@@ -365,13 +514,19 @@ impl Feature {
       ${[...p].map(([features, versions]) => {
   return `${features.map(name => `Feature::${enumify(name)}`).join(' |\n      ')} => {
         ${Object.entries(versions).map(([name, prefixes]) => {
-    return `if let Some(version) = browsers.${name} {
+          let needsVersion = !Object.values(prefixes).every(([min, max]) => min == null && max == null);
+    return `if ${needsVersion ? `let Some(version) = browsers.${name}` : `browsers.${name}.is_some()`} {
           ${Object.entries(prefixes).map(([prefix, [min, max]]) => {
       if (!prefixMapping[prefix]) {
         throw new Error('Missing prefix ' + prefix);
       }
+      let addPrefix = `prefixes |= VendorPrefix::${prefixMapping[prefix]};`;
       let condition;
-      if (max == null) {
+      if (min == null && max == null) {
+        return addPrefix;
+      } else if (min == null) {
+        condition = `version <= ${max}`;
+      } else if (max == null) {
         condition = `version >= ${min}`;
       } else if (min == max) {
         condition = `version == ${min}`;
@@ -380,7 +535,7 @@ impl Feature {
       }
 
       return `if ${condition} {
-            prefixes |= VendorPrefix::${prefixMapping[prefix]};
+            ${addPrefix}
           }`
     }).join('\n          ')}
         }`;

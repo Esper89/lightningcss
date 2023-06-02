@@ -7,7 +7,7 @@ use crate::properties::Property;
 use crate::rules::supports::{SupportsCondition, SupportsRule};
 use crate::rules::{style::StyleRule, CssRule, CssRuleList};
 use crate::selector::{Direction, PseudoClass};
-use crate::targets::Browsers;
+use crate::targets::Targets;
 use crate::vendor_prefix::VendorPrefix;
 use parcel_selectors::parser::Component;
 
@@ -28,7 +28,7 @@ pub(crate) enum DeclarationContext {
 
 #[derive(Debug)]
 pub(crate) struct PropertyHandlerContext<'i, 'o> {
-  pub targets: Option<Browsers>,
+  pub targets: Targets,
   pub is_important: bool,
   supports: Vec<SupportsEntry<'i>>,
   ltr: Vec<Property<'i>>,
@@ -38,7 +38,7 @@ pub(crate) struct PropertyHandlerContext<'i, 'o> {
 }
 
 impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
-  pub fn new(targets: Option<Browsers>, unused_symbols: &'o HashSet<String>) -> Self {
+  pub fn new(targets: Targets, unused_symbols: &'o HashSet<String>) -> Self {
     PropertyHandlerContext {
       targets,
       is_important: false,
@@ -50,18 +50,14 @@ impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
     }
   }
 
-  pub fn is_supported(&self, feature: Feature) -> bool {
+  pub fn should_compile_logical(&self, feature: Feature) -> bool {
     // Don't convert logical properties in style attributes because
     // our fallbacks rely on extra rules to define --ltr and --rtl.
     if self.context == DeclarationContext::StyleAttribute {
-      return true;
+      return false;
     }
 
-    if let Some(targets) = self.targets {
-      feature.is_compatible(targets)
-    } else {
-      true
-    }
+    self.targets.should_compile_logical(feature)
   }
 
   pub fn add_logical_rule(&mut self, ltr: Property<'i>, rtl: Property<'i>) {
@@ -69,7 +65,7 @@ impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
     self.rtl.push(rtl);
   }
 
-  pub fn get_logical_rules<T>(&mut self, style_rule: &StyleRule<'i, T>) -> Vec<CssRule<'i, T>> {
+  pub fn get_logical_rules<T>(&self, style_rule: &StyleRule<'i, T>) -> Vec<CssRule<'i, T>> {
     // TODO: :dir/:lang raises the specificity of the selector. Use :where to lower it?
     let mut dest = Vec::new();
 
@@ -86,7 +82,7 @@ impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
           selectors,
           vendor_prefix: VendorPrefix::None,
           declarations: DeclarationBlock {
-            declarations: std::mem::take(&mut self.$decls),
+            declarations: self.$decls.clone(),
             important_declarations: vec![],
           },
           rules: CssRuleList(vec![]),
@@ -140,36 +136,33 @@ impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
       return;
     }
 
-    if let Some(targets) = self.targets {
-      let fallbacks = unparsed.value.get_fallbacks(targets);
-      for (condition, fallback) in fallbacks {
-        self.add_conditional_property(
-          condition,
-          Property::Unparsed(UnparsedProperty {
-            property_id: unparsed.property_id.clone(),
-            value: fallback,
-          }),
-        );
-      }
+    let fallbacks = unparsed.value.get_fallbacks(self.targets);
+    for (condition, fallback) in fallbacks {
+      self.add_conditional_property(
+        condition,
+        Property::Unparsed(UnparsedProperty {
+          property_id: unparsed.property_id.clone(),
+          value: fallback,
+        }),
+      );
     }
   }
 
-  pub fn get_supports_rules<T>(&mut self, style_rule: &StyleRule<'i, T>) -> Vec<CssRule<'i, T>> {
+  pub fn get_supports_rules<T>(&self, style_rule: &StyleRule<'i, T>) -> Vec<CssRule<'i, T>> {
     if self.supports.is_empty() {
       return Vec::new();
     }
 
     let mut dest = Vec::new();
-    let supports = std::mem::take(&mut self.supports);
-    for entry in supports {
+    for entry in &self.supports {
       dest.push(CssRule::Supports(SupportsRule {
-        condition: entry.condition,
+        condition: entry.condition.clone(),
         rules: CssRuleList(vec![CssRule::Style(StyleRule {
           selectors: style_rule.selectors.clone(),
           vendor_prefix: VendorPrefix::None,
           declarations: DeclarationBlock {
-            declarations: entry.declarations,
-            important_declarations: entry.important_declarations,
+            declarations: entry.declarations.clone(),
+            important_declarations: entry.important_declarations.clone(),
           },
           rules: CssRuleList(vec![]),
           loc: style_rule.loc.clone(),
@@ -179,5 +172,11 @@ impl<'i, 'o> PropertyHandlerContext<'i, 'o> {
     }
 
     dest
+  }
+
+  pub fn reset(&mut self) {
+    self.supports.clear();
+    self.ltr.clear();
+    self.rtl.clear();
   }
 }

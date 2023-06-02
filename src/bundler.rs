@@ -218,7 +218,7 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P, DefaultAtRuleParser> 
 
 impl<'a, 'o, 's, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send> Bundler<'a, 'o, 's, P, T>
 where
-  T::AtRule: Sync + Send + ToCss,
+  T::AtRule: Sync + Send + ToCss + Clone,
 {
   /// Creates a new Bundler using the given source provider.
   /// If a source map is given, the content of each source file included in the bundle will
@@ -771,8 +771,9 @@ mod tests {
   use super::*;
   use crate::{
     css_modules::{self, CssModuleExports, CssModuleReference},
+    parser::ParserFlags,
     stylesheet::{MinifyOptions, PrinterOptions},
-    targets::Browsers,
+    targets::{Browsers, Targets},
   };
   use indoc::indoc;
   use std::collections::HashMap;
@@ -877,15 +878,18 @@ mod tests {
       &fs,
       None,
       ParserOptions {
-        custom_media: true,
+        flags: ParserFlags::CUSTOM_MEDIA,
         ..ParserOptions::default()
       },
     );
     let mut stylesheet = bundler.bundle(Path::new(entry)).unwrap();
-    let targets = Some(Browsers {
-      safari: Some(13 << 16),
-      ..Browsers::default()
-    });
+    let targets = Targets {
+      browsers: Some(Browsers {
+        safari: Some(13 << 16),
+        ..Browsers::default()
+      }),
+      ..Default::default()
+    };
     stylesheet
       .minify(MinifyOptions {
         targets,
@@ -957,7 +961,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -986,7 +990,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1015,7 +1019,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1046,7 +1050,7 @@ mod tests {
           }
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1076,7 +1080,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1106,7 +1110,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1139,7 +1143,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       @media print {
         .b {
           color: #ff0;
@@ -1203,7 +1207,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -1230,7 +1234,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -1294,7 +1298,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1323,7 +1327,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1362,7 +1366,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1400,7 +1404,7 @@ mod tests {
           "/a.css": r#"
           @layer bar, foo;
           @import "b.css" layer(foo);
-          
+
           @layer bar {
             div {
               background: red;
@@ -1410,7 +1414,7 @@ mod tests {
           "/b.css": r#"
           @layer qux, baz;
           @import "c.css" layer(baz);
-          
+
           @layer qux {
             div {
               background: green;
@@ -1420,7 +1424,7 @@ mod tests {
           "/c.css": r#"
           div {
             background: yellow;
-          }      
+          }
         "#
         },
       },
@@ -1445,7 +1449,7 @@ mod tests {
           }
         }
       }
-      
+
       @layer bar {
         div {
           background: red;
@@ -1479,20 +1483,20 @@ mod tests {
     assert_eq!(
       res,
       indoc! { r#"
-      @media (min-width: 1000px) {
+      @media (width >= 1000px) {
         @layer bar {
           #box {
             background: green;
           }
         }
       }
-      
+
       @layer baz {
         #box {
           background: purple;
         }
       }
-      
+
       @layer bar {
         #box {
           background: #ff0;
@@ -1599,7 +1603,7 @@ mod tests {
           "/c.css": r#"
           body {
             background: white;
-            color: black; 
+            color: black;
           }
         "#
         },
@@ -1886,7 +1890,7 @@ mod tests {
         --_8Cs9ZG_fallback: yellow;
         --_8Cs9ZG_opacity: .5;
       }
-      
+
       .GbJUva_env {
         --GbJUva_env-fallback: 20px;
       }
@@ -1965,16 +1969,16 @@ mod tests {
     let source = r#".imported {
       content: "yay, file support!";
     }
-    
+
     .selector {
       margin: 1em;
       background-color: #f60;
     }
-    
+
     .selector .nested {
       margin: 0.5em;
     }
-    
+
     /*# sourceMappingURL=data:application/json;base64,ewoJInZlcnNpb24iOiAzLAoJInNvdXJjZVJvb3QiOiAicm9vdCIsCgkiZmlsZSI6ICJzdGRvdXQiLAoJInNvdXJjZXMiOiBbCgkJInN0ZGluIiwKCQkic2Fzcy9fdmFyaWFibGVzLnNjc3MiLAoJCSJzYXNzL19kZW1vLnNjc3MiCgldLAoJInNvdXJjZXNDb250ZW50IjogWwoJCSJAaW1wb3J0IFwiX3ZhcmlhYmxlc1wiO1xuQGltcG9ydCBcIl9kZW1vXCI7XG5cbi5zZWxlY3RvciB7XG4gIG1hcmdpbjogJHNpemU7XG4gIGJhY2tncm91bmQtY29sb3I6ICRicmFuZENvbG9yO1xuXG4gIC5uZXN0ZWQge1xuICAgIG1hcmdpbjogJHNpemUgLyAyO1xuICB9XG59IiwKCQkiJGJyYW5kQ29sb3I6ICNmNjA7XG4kc2l6ZTogMWVtOyIsCgkJIi5pbXBvcnRlZCB7XG4gIGNvbnRlbnQ6IFwieWF5LCBmaWxlIHN1cHBvcnQhXCI7XG59IgoJXSwKCSJtYXBwaW5ncyI6ICJBRUFBLFNBQVMsQ0FBQztFQUNSLE9BQU8sRUFBRSxvQkFBcUI7Q0FDL0I7O0FGQ0QsU0FBUyxDQUFDO0VBQ1IsTUFBTSxFQ0hELEdBQUc7RURJUixnQkFBZ0IsRUNMTCxJQUFJO0NEVWhCOztBQVBELFNBQVMsQ0FJUCxPQUFPLENBQUM7RUFDTixNQUFNLEVDUEgsS0FBRztDRFFQIiwKCSJuYW1lcyI6IFtdCn0= */"#;
 
     let fs = TestProvider {

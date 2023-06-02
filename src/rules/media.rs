@@ -26,7 +26,7 @@ pub struct MediaRule<'i, R = DefaultAtRule> {
   pub loc: Location,
 }
 
-impl<'i, T> MediaRule<'i, T> {
+impl<'i, T: Clone> MediaRule<'i, T> {
   pub(crate) fn minify(
     &mut self,
     context: &mut MinifyContext<'_, 'i>,
@@ -38,6 +38,7 @@ impl<'i, T> MediaRule<'i, T> {
       self.query.transform_custom_media(self.loc, custom_media)?;
     }
 
+    self.query.transform_resolution(*context.targets);
     Ok(self.rules.0.is_empty() || self.query.never_matches())
   }
 }

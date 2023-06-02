@@ -40,6 +40,14 @@ pub trait PseudoElement<'i>: Sized + ToCss {
   fn is_webkit_scrollbar(&self) -> bool {
     false
   }
+
+  fn is_view_transition(&self) -> bool {
+    false
+  }
+
+  fn is_unknown(&self) -> bool {
+    false
+  }
 }
 
 /// A trait that represents a pseudo-class.
@@ -85,6 +93,7 @@ fn to_ascii_lowercase<'i>(s: CowRcStr<'i>) -> CowRcStr<'i> {
 
 bitflags! {
     /// Flags that indicate at which point of parsing a selector are we.
+    #[derive(PartialEq, Eq, Clone, Copy)]
     struct SelectorParsingState: u16 {
         /// Whether we should avoid adding default namespaces to selectors that
         /// aren't type or universal selectors.
@@ -114,7 +123,7 @@ bitflags! {
         const AFTER_NON_STATEFUL_PSEUDO_ELEMENT = 1 << 4;
 
         /// Whether we are after any of the pseudo-like things.
-        const AFTER_PSEUDO = Self::AFTER_PART.bits | Self::AFTER_SLOTTED.bits | Self::AFTER_PSEUDO_ELEMENT.bits;
+        const AFTER_PSEUDO = Self::AFTER_PART.bits() | Self::AFTER_SLOTTED.bits() | Self::AFTER_PSEUDO_ELEMENT.bits();
 
         /// Whether we explicitly disallow combinators.
         const DISALLOW_COMBINATORS = 1 << 5;
@@ -126,6 +135,7 @@ bitflags! {
         const AFTER_NESTING = 1 << 7;
 
         const AFTER_WEBKIT_SCROLLBAR = 1 << 8;
+        const AFTER_VIEW_TRANSITION = 1 << 9;
     }
 }
 
@@ -338,6 +348,10 @@ pub trait Parser<'i> {
   }
 
   fn is_nesting_allowed(&self) -> bool {
+    false
+  }
+
+  fn deep_combinator_enabled(&self) -> bool {
     false
   }
 }
@@ -1118,6 +1132,15 @@ pub enum Combinator {
   /// Another combinator used for `::part()`, which represents the jump from
   /// the part to the containing shadow host.
   Part,
+
+  /// Non-standard Vue >>> combinator.
+  /// https://vue-loader.vuejs.org/guide/scoped-css.html#deep-selectors
+  DeepDescendant,
+  /// Non-standard /deep/ combinator.
+  /// Appeared in early versions of the css-scoping-1 specification:
+  /// https://www.w3.org/TR/2014/WD-css-scoping-1-20140403/#deep-combinator
+  /// And still supported as an alias for >>> by Vue.
+  Deep,
 }
 
 impl Combinator {
@@ -1760,6 +1783,8 @@ impl ToCss for Combinator {
       Combinator::Descendant => dest.write_str(" "),
       Combinator::NextSibling => dest.write_str(" + "),
       Combinator::LaterSibling => dest.write_str(" ~ "),
+      Combinator::DeepDescendant => dest.write_str(" >>> "),
+      Combinator::Deep => dest.write_str(" /deep/ "),
       Combinator::PseudoElement | Combinator::Part | Combinator::SlotAssignment => Ok(()),
     }
   }
@@ -2010,7 +2035,18 @@ where
         Err(_e) => break 'outer_loop,
         Ok(&Token::WhiteSpace(_)) => any_whitespace = true,
         Ok(&Token::Delim('>')) => {
-          combinator = Combinator::Child;
+          if parser.deep_combinator_enabled()
+            && input
+              .try_parse(|input| {
+                input.expect_delim('>')?;
+                input.expect_delim('>')
+              })
+              .is_ok()
+          {
+            combinator = Combinator::DeepDescendant;
+          } else {
+            combinator = Combinator::Child;
+          }
           break;
         }
         Ok(&Token::Delim('+')) => {
@@ -2020,6 +2056,20 @@ where
         Ok(&Token::Delim('~')) => {
           combinator = Combinator::LaterSibling;
           break;
+        }
+        Ok(&Token::Delim('/')) if parser.deep_combinator_enabled() => {
+          if input
+            .try_parse(|input| {
+              input.expect_ident_matching("deep")?;
+              input.expect_delim('/')
+            })
+            .is_ok()
+          {
+            combinator = Combinator::Deep;
+            break;
+          } else {
+            break 'outer_loop;
+          }
         }
         Ok(_) => {
           input.reset(&before_this_token);
@@ -2594,14 +2644,19 @@ where
         builder.push_simple_selector(Component::Slotted(selector));
       }
       SimpleSelectorParseResult::PseudoElement(p) => {
-        state.insert(SelectorParsingState::AFTER_PSEUDO_ELEMENT);
+        if !p.is_unknown() {
+          state.insert(SelectorParsingState::AFTER_PSEUDO_ELEMENT);
+          builder.push_combinator(Combinator::PseudoElement);
+        }
         if !p.accepts_state_pseudo_classes() {
           state.insert(SelectorParsingState::AFTER_NON_STATEFUL_PSEUDO_ELEMENT);
         }
         if p.is_webkit_scrollbar() {
           state.insert(SelectorParsingState::AFTER_WEBKIT_SCROLLBAR);
         }
-        builder.push_combinator(Combinator::PseudoElement);
+        if p.is_view_transition() {
+          state.insert(SelectorParsingState::AFTER_VIEW_TRANSITION);
+        }
         builder.push_simple_selector(Component::PseudoElement(p));
       }
     }
@@ -2913,6 +2968,15 @@ where
         "last-of-type" => return Ok(Component::Nth(NthSelectorData::last(/* of_type = */ true))),
         "only-of-type" => return Ok(Component::Nth(NthSelectorData::only(/* of_type = */ true))),
         _ => {},
+    }
+  }
+
+  // The view-transition pseudo elements accept the :only-child pseudo class.
+  // https://w3c.github.io/csswg-drafts/css-view-transitions-1/#pseudo-root
+  if state.intersects(SelectorParsingState::AFTER_VIEW_TRANSITION) {
+    match_ignore_ascii_case! { &name,
+        "only-child" => return Ok(Component::Nth(NthSelectorData::only(/* of_type = */ false))),
+        _ => {}
     }
   }
 

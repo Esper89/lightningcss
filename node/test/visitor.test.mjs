@@ -28,7 +28,7 @@ test('px to rem', () => {
     }
   });
 
-  assert.equal(res.code.toString(), '.foo{width:2rem;height:calc(100vh - 4rem);--custom:calc(var(--foo) + 2rem)}');
+  assert.equal(res.code.toString(), '.foo{--custom:calc(var(--foo) + 2rem);width:2rem;height:calc(100vh - 4rem)}');
 });
 
 test('custom units', () => {
@@ -170,7 +170,7 @@ test('env function', () => {
     }
   });
 
-  assert.equal(res.code.toString(), '@media (max-width:600px){body{padding:20px}}');
+  assert.equal(res.code.toString(), '@media (width<=600px){body{padding:20px}}');
 });
 
 test('specific environment variables', () => {
@@ -212,7 +212,7 @@ test('specific environment variables', () => {
     }
   });
 
-  assert.equal(res.code.toString(), '@media (max-width:600px){body{padding:20px}}');
+  assert.equal(res.code.toString(), '@media (width<=600px){body{padding:20px}}');
 });
 
 test('url', () => {
@@ -401,6 +401,9 @@ test('focus visible', () => {
         color: red;
       }
     `),
+    targets: {
+      safari: 14 << 16
+    },
     visitor: {
       Rule: {
         style(rule) {
@@ -986,6 +989,68 @@ test('nth of S to nth-of-type', () => {
   });
 
   assert.equal(res.code.toString(), 'a:nth-of-type(2n){color:red}');
+});
+
+test('media query raw', () => {
+  let res = transform({
+    filename: 'test.css',
+    minify: true,
+    code: Buffer.from(`
+      @breakpoints {
+        .m-1 {
+          margin: 10px;
+        }
+      }
+    `),
+    customAtRules: {
+      breakpoints: {
+        prelude: null,
+        body: "rule-list",
+      },
+    },
+    visitor: {
+      Rule: {
+        custom: {
+          breakpoints({ body, loc }) {
+            /** @type {import('lightningcss').ReturnedRule[]} */
+            const value = [];
+
+            for (let rule of body.value) {
+              if (rule.type !== 'style') {
+                continue;
+              }
+              const clone = structuredClone(rule);
+              for (let selector of clone.value.selectors) {
+                for (let component of selector) {
+                  if (component.type === 'class') {
+                    component.name = `sm:${component.name}`;
+                  }
+                }
+              }
+
+              value.push(rule);
+              value.push({
+                type: "media",
+                value: {
+                  rules: [clone],
+                  loc,
+                  query: {
+                    mediaQueries: [
+                      { raw: '(min-width: 500px)' }
+                    ]
+                  }
+                }
+              });
+            }
+
+            return value;
+          }
+        }
+      }
+    }
+  });
+
+  assert.equal(res.code.toString(), '.m-1{margin:10px}@media (width>=500px){.sm\\:m-1{margin:10px}}');
 });
 
 test.run();

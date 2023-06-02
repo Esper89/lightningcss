@@ -6,7 +6,7 @@ use crate::error::{ParserError, PrinterError};
 use crate::printer::Printer;
 use crate::properties::{Property, PropertyId};
 use crate::stylesheet::{ParserOptions, PrinterOptions};
-use crate::targets::Browsers;
+use crate::targets::{Browsers, Targets};
 use crate::vendor_prefix::VendorPrefix;
 use cssparser::*;
 
@@ -112,7 +112,7 @@ pub(crate) trait FromStandard<T>: Sized {
 }
 
 pub(crate) trait FallbackValues: Sized {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self>;
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self>;
 }
 
 /// Trait for shorthand properties.
@@ -151,6 +151,7 @@ macro_rules! impl_op {
 }
 
 pub(crate) use impl_op;
+use smallvec::SmallVec;
 
 /// A trait for values that potentially support a binary operation (e.g. if they have the same unit).
 pub trait TryOp: Sized {
@@ -233,6 +234,24 @@ pub trait Zero {
 
   /// Returns whether the value is zero.
   fn is_zero(&self) -> bool;
+}
+
+/// A trait for values that can check if they are compatible with browser targets.
+pub trait IsCompatible {
+  /// Returns whether the value is compatible with all of the given browser targets.
+  fn is_compatible(&self, browsers: Browsers) -> bool;
+}
+
+impl<T: IsCompatible> IsCompatible for SmallVec<[T; 1]> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    self.iter().all(|v| v.is_compatible(browsers))
+  }
+}
+
+impl<T: IsCompatible> IsCompatible for Vec<T> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    self.iter().all(|v| v.is_compatible(browsers))
+  }
 }
 
 /// A trait to provide parsing of custom at-rules.

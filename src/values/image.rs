@@ -8,8 +8,8 @@ use crate::dependencies::{Dependency, UrlDependency};
 use crate::error::{ParserError, PrinterError};
 use crate::prefixes::{is_webkit_gradient, Feature};
 use crate::printer::Printer;
-use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, ToCss};
+use crate::targets::{Browsers, Targets};
+use crate::traits::{FallbackValues, IsCompatible, Parse, ToCss};
 use crate::values::string::CowArcStr;
 use crate::values::url::Url;
 use crate::vendor_prefix::VendorPrefix;
@@ -64,7 +64,7 @@ impl<'i> Image<'i> {
   }
 
   /// Returns the vendor prefixes that are needed for the given browser targets.
-  pub fn get_necessary_prefixes(&self, targets: Browsers) -> VendorPrefix {
+  pub fn get_necessary_prefixes(&self, targets: Targets) -> VendorPrefix {
     match self {
       Image::Gradient(grad) => grad.get_necessary_prefixes(targets),
       Image::ImageSet(image_set) => image_set.get_necessary_prefixes(targets),
@@ -92,7 +92,7 @@ impl<'i> Image<'i> {
   }
 
   /// Returns the color fallbacks that are needed for the given browser targets.
-  pub fn get_necessary_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  pub fn get_necessary_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     match self {
       Image::Gradient(grad) => grad.get_necessary_fallbacks(targets),
       _ => ColorFallbackKind::empty(),
@@ -106,29 +106,33 @@ impl<'i> Image<'i> {
       _ => self.clone(),
     }
   }
+}
 
-  pub(crate) fn should_preserve_fallback(&self, fallback: &Option<Image>, targets: Option<Browsers>) -> bool {
-    if let (Some(fallback), Some(targets)) = (&fallback, targets) {
-      return !compat::Feature::ImageSet.is_compatible(targets)
-        && matches!(self, Image::ImageSet(..))
-        && !matches!(fallback, Image::ImageSet(..));
+impl<'i> IsCompatible for Image<'i> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      Image::Gradient(g) => match &**g {
+        Gradient::Linear(g) => {
+          compat::Feature::LinearGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::RepeatingLinear(g) => {
+          compat::Feature::RepeatingLinearGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::Radial(g) => {
+          compat::Feature::RadialGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::RepeatingRadial(g) => {
+          compat::Feature::RepeatingRadialGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::Conic(g) => compat::Feature::ConicGradient.is_compatible(browsers) && g.is_compatible(browsers),
+        Gradient::RepeatingConic(g) => {
+          compat::Feature::RepeatingConicGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::WebKitGradient(..) => is_webkit_gradient(browsers),
+      },
+      Image::ImageSet(i) => i.is_compatible(browsers),
+      Image::Url(..) | Image::None => true,
     }
-
-    false
-  }
-
-  pub(crate) fn should_preserve_fallbacks(
-    images: &SmallVec<[Image; 1]>,
-    fallback: Option<&SmallVec<[Image; 1]>>,
-    targets: Option<Browsers>,
-  ) -> bool {
-    if let (Some(fallback), Some(targets)) = (&fallback, targets) {
-      return !compat::Feature::ImageSet.is_compatible(targets)
-        && images.iter().any(|x| matches!(x, Image::ImageSet(..)))
-        && !fallback.iter().any(|x| matches!(x, Image::ImageSet(..)));
-    }
-
-    false
   }
 }
 
@@ -137,7 +141,7 @@ pub(crate) trait ImageFallback<'i>: Sized {
   fn with_image(&self, image: Image<'i>) -> Self;
 
   #[inline]
-  fn get_necessary_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  fn get_necessary_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     self.get_image().get_necessary_fallbacks(targets)
   }
 
@@ -160,7 +164,7 @@ impl<'i> ImageFallback<'i> for Image<'i> {
 }
 
 impl<'i> FallbackValues for Image<'i> {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     // Determine which prefixes and color fallbacks are needed.
     let prefixes = self.get_necessary_prefixes(targets);
     let fallbacks = self.get_necessary_fallbacks(targets);
@@ -178,7 +182,7 @@ impl<'i> FallbackValues for Image<'i> {
 
     // Legacy -webkit-gradient()
     if prefixes.contains(VendorPrefix::WebKit)
-      && is_webkit_gradient(targets)
+      && targets.browsers.map(is_webkit_gradient).unwrap_or(false)
       && matches!(prefix_image, Image::Gradient(_))
     {
       if let Ok(legacy) = prefix_image.get_legacy_webkit() {
@@ -226,7 +230,7 @@ impl<'i> FallbackValues for Image<'i> {
 }
 
 impl<'i, T: ImageFallback<'i>> FallbackValues for SmallVec<[T; 1]> {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     // Determine what vendor prefixes and color fallbacks are needed.
     let mut prefixes = VendorPrefix::empty();
     let mut fallbacks = ColorFallbackKind::empty();
@@ -247,7 +251,7 @@ impl<'i, T: ImageFallback<'i>> FallbackValues for SmallVec<[T; 1]> {
     let prefix_images = rgb.as_ref().unwrap_or(&self);
 
     // Legacy -webkit-gradient()
-    if prefixes.contains(VendorPrefix::WebKit) && is_webkit_gradient(targets) {
+    if prefixes.contains(VendorPrefix::WebKit) && targets.browsers.map(is_webkit_gradient).unwrap_or(false) {
       let images: SmallVec<[T; 1]> = prefix_images
         .iter()
         .map(|item| item.get_image().get_legacy_webkit().map(|image| item.with_image(image)))
@@ -369,12 +373,8 @@ impl<'i> ImageSet<'i> {
   }
 
   /// Returns the vendor prefixes needed for the given browser targets.
-  pub fn get_necessary_prefixes(&self, targets: Browsers) -> VendorPrefix {
-    if self.vendor_prefix.contains(VendorPrefix::None) {
-      Feature::ImageSet.prefixes_for(targets)
-    } else {
-      self.vendor_prefix
-    }
+  pub fn get_necessary_prefixes(&self, targets: Targets) -> VendorPrefix {
+    targets.prefixes(self.vendor_prefix, Feature::ImageSet)
   }
 
   /// Returns the `image-set()` value with the given vendor prefix.
@@ -420,6 +420,13 @@ impl<'i> ToCss for ImageSet<'i> {
       option.to_css(dest, self.vendor_prefix != VendorPrefix::None)?;
     }
     dest.write_char(')')
+  }
+}
+
+impl<'i> IsCompatible for ImageSet<'i> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    compat::Feature::ImageSet.is_compatible(browsers)
+      && self.options.iter().all(|opt| opt.image.is_compatible(browsers))
   }
 }
 

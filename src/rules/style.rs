@@ -5,7 +5,6 @@ use std::ops::Range;
 
 use super::Location;
 use super::MinifyContext;
-use crate::compat::Feature;
 use crate::context::DeclarationContext;
 use crate::declaration::DeclarationBlock;
 use crate::error::ParserError;
@@ -13,8 +12,8 @@ use crate::error::{MinifyError, PrinterError, PrinterErrorKind};
 use crate::parser::DefaultAtRule;
 use crate::printer::Printer;
 use crate::rules::CssRuleList;
-use crate::selector::{is_compatible, is_unused, SelectorList};
-use crate::targets::Browsers;
+use crate::selector::{downlevel_selectors, get_prefix, is_compatible, is_unused, SelectorList};
+use crate::targets::{should_compile, Targets};
 use crate::traits::ToCss;
 use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
@@ -50,7 +49,7 @@ fn default_rule_list<'i, R>() -> CssRuleList<'i, R> {
   CssRuleList(Vec::new())
 }
 
-impl<'i, T> StyleRule<'i, T> {
+impl<'i, T: Clone> StyleRule<'i, T> {
   pub(crate) fn minify(
     &mut self,
     context: &mut MinifyContext<'_, 'i>,
@@ -82,6 +81,11 @@ impl<'i, T> StyleRule<'i, T> {
       }
     }
 
+    self.vendor_prefix = get_prefix(&self.selectors);
+    if self.vendor_prefix.contains(VendorPrefix::None) & context.targets.should_compile_selectors() {
+      self.vendor_prefix = downlevel_selectors(self.selectors.0.as_mut_slice(), *context.targets);
+    }
+
     Ok(false)
   }
 }
@@ -89,13 +93,13 @@ impl<'i, T> StyleRule<'i, T> {
 impl<'i, T> StyleRule<'i, T> {
   /// Returns whether the rule is empty.
   pub fn is_empty(&self) -> bool {
-    self.declarations.is_empty() && self.rules.0.is_empty()
+    self.selectors.0.is_empty() || (self.declarations.is_empty() && self.rules.0.is_empty())
   }
 
   /// Returns whether the selectors in the rule are compatible
   /// with all of the given browser targets.
-  pub fn is_compatible(&self, targets: Option<Browsers>) -> bool {
-    is_compatible(&self.selectors, targets)
+  pub fn is_compatible(&self, targets: Targets) -> bool {
+    is_compatible(&self.selectors.0, targets)
   }
 
   /// Returns the line and column range of the property key and value at the given index in this style rule.
@@ -194,29 +198,18 @@ impl<'a, 'i, T: ToCss> ToCss for StyleRule<'i, T> {
       self.to_css_base(dest)
     } else {
       let mut first_rule = true;
-      macro_rules! prefix {
-        ($prefix: ident) => {
-          if self.vendor_prefix.contains(VendorPrefix::$prefix) {
-            #[allow(unused_assignments)]
-            if first_rule {
-              first_rule = false;
-            } else {
-              if !dest.minify {
-                dest.write_char('\n')?; // no indent
-              }
-              dest.newline()?;
-            }
-            dest.vendor_prefix = VendorPrefix::$prefix;
-            self.to_css_base(dest)?;
+      for prefix in self.vendor_prefix {
+        if first_rule {
+          first_rule = false;
+        } else {
+          if !dest.minify {
+            dest.write_char('\n')?; // no indent
           }
-        };
+          dest.newline()?;
+        }
+        dest.vendor_prefix = prefix;
+        self.to_css_base(dest)?;
       }
-
-      prefix!(WebKit);
-      prefix!(Moz);
-      prefix!(Ms);
-      prefix!(O);
-      prefix!(None);
 
       dest.vendor_prefix = VendorPrefix::empty();
       Ok(())
@@ -230,9 +223,7 @@ impl<'a, 'i, T: ToCss> StyleRule<'i, T> {
     W: std::fmt::Write,
   {
     // If supported, or there are no targets, preserve nesting. Otherwise, write nested rules after parent.
-    let supports_nesting = self.rules.0.is_empty()
-      || dest.targets.is_none()
-      || Feature::CssNesting.is_compatible(dest.targets.unwrap());
+    let supports_nesting = self.rules.0.is_empty() || !should_compile!(dest.targets, Nesting);
     let len = self.declarations.declarations.len() + self.declarations.important_declarations.len();
     let has_declarations = supports_nesting || len > 0 || self.rules.0.is_empty();
 

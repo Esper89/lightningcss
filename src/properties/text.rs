@@ -10,11 +10,12 @@ use crate::error::{ParserError, PrinterError};
 use crate::macros::{define_shorthand, enum_property};
 use crate::prefixes::Feature;
 use crate::printer::Printer;
-use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, PropertyHandler, Shorthand, ToCss, Zero};
+use crate::targets::{should_compile, Browsers, Targets};
+use crate::traits::{FallbackValues, IsCompatible, Parse, PropertyHandler, Shorthand, ToCss, Zero};
 use crate::values::calc::{Calc, MathFunction};
 use crate::values::color::{ColorFallbackKind, CssColor};
 use crate::values::length::{Length, LengthPercentage, LengthValue};
+use crate::values::percentage::Percentage;
 use crate::values::string::CSSString;
 use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
@@ -51,6 +52,7 @@ bitflags! {
   /// All combinations of flags is supported.
   #[cfg_attr(feature = "visitor", derive(Visit))]
   #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(from = "SerializedTextTransformOther", into = "SerializedTextTransformOther"))]
+  #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
   pub struct TextTransformOther: u8 {
     /// Puts all typographic character units in full-width form.
     const FullWidth    = 0b00000001;
@@ -459,12 +461,59 @@ impl ToCss for TextIndent {
   }
 }
 
+/// A value for the [text-size-adjust](https://w3c.github.io/csswg-drafts/css-size-adjust/#adjustment-control) property.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(tag = "type", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+pub enum TextSizeAdjust {
+  /// Use the default size adjustment when displaying on a small device.
+  Auto,
+  /// No size adjustment when displaying on a small device.
+  None,
+  /// When displaying on a small device, the font size is multiplied by this percentage.
+  Percentage(Percentage),
+}
+
+impl<'i> Parse<'i> for TextSizeAdjust {
+  fn parse<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
+    if let Ok(p) = input.try_parse(Percentage::parse) {
+      return Ok(TextSizeAdjust::Percentage(p));
+    }
+
+    let ident = input.expect_ident_cloned()?;
+    match_ignore_ascii_case! {&*ident,
+      "auto" => Ok(TextSizeAdjust::Auto),
+      "none" => Ok(TextSizeAdjust::None),
+      _ => Err(input.new_unexpected_token_error(Token::Ident(ident.clone())))
+    }
+  }
+}
+
+impl ToCss for TextSizeAdjust {
+  fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    match self {
+      TextSizeAdjust::Auto => dest.write_str("auto"),
+      TextSizeAdjust::None => dest.write_str("none"),
+      TextSizeAdjust::Percentage(p) => p.to_css(dest),
+    }
+  }
+}
+
 bitflags! {
   /// A value for the [text-decoration-line](https://www.w3.org/TR/2020/WD-css-text-decor-4-20200506/#text-decoration-line-property) property.
   ///
   /// Multiple lines may be specified by combining the flags.
   #[cfg_attr(feature = "visitor", derive(Visit))]
   #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(from = "SerializedTextDecorationLine", into = "SerializedTextDecorationLine"))]
+  #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
   pub struct TextDecorationLine: u8 {
     /// Each line of text is underlined.
     const Underline     = 0b00000001;
@@ -831,7 +880,7 @@ impl ToCss for TextDecoration {
 }
 
 impl FallbackValues for TextDecoration {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     self
       .color
       .get_fallbacks(targets)
@@ -1028,7 +1077,7 @@ impl<'i> ToCss for TextEmphasis<'i> {
 }
 
 impl<'i> FallbackValues for TextEmphasis<'i> {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     self
       .color
       .get_fallbacks(targets)
@@ -1121,7 +1170,6 @@ impl ToCss for TextEmphasisPosition {
 
 #[derive(Default)]
 pub(crate) struct TextDecorationHandler<'i> {
-  targets: Option<Browsers>,
   line: Option<(TextDecorationLine, VendorPrefix)>,
   thickness: Option<TextDecorationThickness>,
   style: Option<(TextDecorationStyle, VendorPrefix)>,
@@ -1130,15 +1178,6 @@ pub(crate) struct TextDecorationHandler<'i> {
   emphasis_color: Option<(CssColor, VendorPrefix)>,
   emphasis_position: Option<(TextEmphasisPosition, VendorPrefix)>,
   has_any: bool,
-}
-
-impl<'i> TextDecorationHandler<'i> {
-  pub fn new(targets: Option<Browsers>) -> TextDecorationHandler<'i> {
-    TextDecorationHandler {
-      targets,
-      ..TextDecorationHandler::default()
-    }
-  }
 }
 
 impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
@@ -1207,7 +1246,7 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
         use super::text::*;
         macro_rules! logical {
           ($ltr: ident, $rtl: ident) => {{
-            let logical_supported = context.is_supported(compat::Feature::LogicalTextAlign);
+            let logical_supported = !context.should_compile_logical(compat::Feature::LogicalTextAlign);
             if logical_supported {
               dest.push(property.clone());
             } else {
@@ -1227,13 +1266,13 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
       }
       Unparsed(val) if is_text_decoration_property(&val.property_id) => {
         self.finalize(dest, context);
-        let mut unparsed = val.get_prefixed(self.targets, Feature::TextDecoration);
+        let mut unparsed = val.get_prefixed(context.targets, Feature::TextDecoration);
         context.add_unparsed_fallbacks(&mut unparsed);
         dest.push(Property::Unparsed(unparsed))
       }
       Unparsed(val) if is_text_emphasis_property(&val.property_id) => {
         self.finalize(dest, context);
-        let mut unparsed = val.get_prefixed(self.targets, Feature::TextEmphasis);
+        let mut unparsed = val.get_prefixed(context.targets, Feature::TextEmphasis);
         context.add_unparsed_fallbacks(&mut unparsed);
         dest.push(Property::Unparsed(unparsed))
       }
@@ -1243,7 +1282,7 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
     true
   }
 
-  fn finalize(&mut self, dest: &mut DeclarationList<'i>, _: &mut PropertyHandlerContext<'i, '_>) {
+  fn finalize(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
     if !self.has_any {
       return;
     }
@@ -1266,12 +1305,7 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
         let mut prefix = intersection;
 
         // Some browsers don't support thickness in the shorthand property yet.
-        let supports_thickness = if let Some(targets) = self.targets {
-          compat::Feature::TextDecorationThicknessShorthand.is_compatible(targets)
-        } else {
-          true
-        };
-
+        let supports_thickness = context.targets.is_compatible(compat::Feature::TextDecorationThicknessShorthand);
         let mut decoration = TextDecoration {
           line: line.clone(),
           thickness: if supports_thickness {
@@ -1287,13 +1321,11 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
         if prefix.contains(VendorPrefix::None)
           && (*style != TextDecorationStyle::default() || *color != CssColor::current_color())
         {
-          if let Some(targets) = self.targets {
-            prefix = Feature::TextDecoration.prefixes_for(targets);
+          prefix = context.targets.prefixes(VendorPrefix::None, Feature::TextDecoration);
 
-            let fallbacks = decoration.get_fallbacks(targets);
-            for fallback in fallbacks {
-              dest.push(Property::TextDecoration(fallback, prefix))
-            }
+          let fallbacks = decoration.get_fallbacks(context.targets);
+          for fallback in fallbacks {
+            dest.push(Property::TextDecoration(fallback, prefix))
           }
         }
 
@@ -1311,15 +1343,11 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
       ($key: ident, $prop: ident) => {
         if let Some((mut val, vp)) = $key {
           if !vp.is_empty() {
-            let mut prefix = vp;
+            let prefix = context.targets.prefixes(vp, Feature::$prop);
             if prefix.contains(VendorPrefix::None) {
-              if let Some(targets) = self.targets {
-                prefix = Feature::$prop.prefixes_for(targets);
-
-                let fallbacks = val.get_fallbacks(targets);
-                for fallback in fallbacks {
-                  dest.push(Property::$prop(fallback, prefix))
-                }
+              let fallbacks = val.get_fallbacks(context.targets);
+              for fallback in fallbacks {
+                dest.push(Property::$prop(fallback, prefix))
               }
             }
             dest.push(Property::$prop(val, prefix))
@@ -1332,12 +1360,7 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
       ($key: ident, $prop: ident) => {
         if let Some((val, vp)) = $key {
           if !vp.is_empty() {
-            let mut prefix = vp;
-            if prefix.contains(VendorPrefix::None) {
-              if let Some(targets) = self.targets {
-                prefix = Feature::$prop.prefixes_for(targets);
-              }
-            }
+            let prefix = context.targets.prefixes(vp, Feature::$prop);
             dest.push(Property::$prop(val, prefix))
           }
         }
@@ -1351,9 +1374,9 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
     if let Some(thickness) = thickness {
       // Percentages in the text-decoration-thickness property are based on 1em.
       // If unsupported, compile this to a calc() instead.
-      match (self.targets, thickness) {
-        (Some(targets), TextDecorationThickness::LengthPercentage(LengthPercentage::Percentage(p)))
-          if !compat::Feature::TextDecorationThicknessPercent.is_compatible(targets) =>
+      match thickness {
+        TextDecorationThickness::LengthPercentage(LengthPercentage::Percentage(p))
+          if should_compile!(context.targets, TextDecorationThicknessPercent) =>
         {
           let calc = Calc::Function(Box::new(MathFunction::Calc(Calc::Product(
             p.0,
@@ -1362,27 +1385,23 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
           let thickness = TextDecorationThickness::LengthPercentage(LengthPercentage::Calc(Box::new(calc)));
           dest.push(Property::TextDecorationThickness(thickness));
         }
-        (_, thickness) => dest.push(Property::TextDecorationThickness(thickness)),
+        thickness => dest.push(Property::TextDecorationThickness(thickness)),
       }
     }
 
     if let (Some((style, style_vp)), Some((color, color_vp))) = (&mut emphasis_style, &mut emphasis_color) {
       let intersection = *style_vp | *color_vp;
       if !intersection.is_empty() {
-        let mut prefix = intersection;
+        let prefix = context.targets.prefixes(intersection, Feature::TextEmphasis);
         let mut emphasis = TextEmphasis {
           style: style.clone(),
           color: color.clone(),
         };
 
         if prefix.contains(VendorPrefix::None) {
-          if let Some(targets) = self.targets {
-            prefix = Feature::TextEmphasis.prefixes_for(targets);
-
-            let fallbacks = emphasis.get_fallbacks(targets);
-            for fallback in fallbacks {
-              dest.push(Property::TextEmphasis(fallback, prefix))
-            }
+          let fallbacks = emphasis.get_fallbacks(context.targets);
+          for fallback in fallbacks {
+            dest.push(Property::TextEmphasis(fallback, prefix))
           }
         }
 
@@ -1397,15 +1416,10 @@ impl<'i> PropertyHandler<'i> for TextDecorationHandler<'i> {
 
     if let Some((pos, vp)) = emphasis_position {
       if !vp.is_empty() {
-        let mut prefix = vp;
-        if prefix.contains(VendorPrefix::None) {
-          if let Some(targets) = self.targets {
-            prefix = Feature::TextEmphasisPosition.prefixes_for(targets);
-            // Prefixed version does not support horizontal keyword.
-            if pos.horizontal != TextEmphasisPositionHorizontal::Right {
-              prefix = VendorPrefix::None;
-            }
-          }
+        let mut prefix = context.targets.prefixes(vp, Feature::TextEmphasisPosition);
+        // Prefixed version does not support horizontal keyword.
+        if pos.horizontal != TextEmphasisPositionHorizontal::Right {
+          prefix = VendorPrefix::None;
         }
         dest.push(Property::TextEmphasisPosition(pos, prefix))
       }
@@ -1505,6 +1519,16 @@ impl ToCss for TextShadow {
   }
 }
 
+impl IsCompatible for TextShadow {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    self.color.is_compatible(browsers)
+      && self.x_offset.is_compatible(browsers)
+      && self.y_offset.is_compatible(browsers)
+      && self.blur.is_compatible(browsers)
+      && self.spread.is_compatible(browsers)
+  }
+}
+
 #[inline]
 fn is_text_decoration_property(property_id: &PropertyId) -> bool {
   match property_id {
@@ -1529,7 +1553,7 @@ fn is_text_emphasis_property(property_id: &PropertyId) -> bool {
 }
 
 impl FallbackValues for SmallVec<[TextShadow; 1]> {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<Self> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<Self> {
     let mut fallbacks = ColorFallbackKind::empty();
     for shadow in self.iter() {
       fallbacks |= shadow.color.get_necessary_fallbacks(targets);

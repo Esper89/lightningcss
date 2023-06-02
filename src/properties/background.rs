@@ -7,8 +7,8 @@ use crate::macros::*;
 use crate::prefixes::Feature;
 use crate::printer::Printer;
 use crate::properties::{Property, PropertyId, VendorPrefix};
-use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, PropertyHandler, Shorthand, ToCss};
+use crate::targets::{Browsers, Targets};
+use crate::traits::{FallbackValues, IsCompatible, Parse, PropertyHandler, Shorthand, ToCss};
 use crate::values::color::ColorFallbackKind;
 use crate::values::image::ImageFallback;
 use crate::values::{color::CssColor, image::Image, length::LengthPercentageOrAuto, position::*};
@@ -93,6 +93,17 @@ impl ToCss for BackgroundSize {
   }
 }
 
+impl IsCompatible for BackgroundSize {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      BackgroundSize::Explicit { width, height } => {
+        width.is_compatible(browsers) && height.is_compatible(browsers)
+      }
+      BackgroundSize::Cover | BackgroundSize::Contain => true,
+    }
+  }
+}
+
 enum_property! {
   /// A [`<repeat-style>`](https://www.w3.org/TR/css-backgrounds-3/#typedef-repeat-style) value,
   /// used within the `background-repeat` property to represent how a background image is repeated
@@ -170,6 +181,12 @@ impl ToCss for BackgroundRepeat {
         Ok(())
       }
     }
+  }
+}
+
+impl IsCompatible for BackgroundRepeat {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
   }
 }
 
@@ -520,7 +537,7 @@ impl<'i> ImageFallback<'i> for Background<'i> {
   }
 
   #[inline]
-  fn get_necessary_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  fn get_necessary_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     self.color.get_necessary_fallbacks(targets) | self.get_image().get_necessary_fallbacks(targets)
   }
 
@@ -754,9 +771,25 @@ impl<'i> Shorthand<'i> for SmallVec<[Background<'i>; 1]> {
   }
 }
 
+property_bitflags! {
+  #[derive(Default)]
+  struct BackgroundProperty: u16 {
+    const BackgroundColor = 1 << 0;
+    const BackgroundImage = 1 << 1;
+    const BackgroundPositionX = 1 << 2;
+    const BackgroundPositionY = 1 << 3;
+    const BackgroundPosition = Self::BackgroundPositionX.bits() | Self::BackgroundPositionY.bits();
+    const BackgroundRepeat = 1 << 4;
+    const BackgroundSize = 1 << 5;
+    const BackgroundAttachment = 1 << 6;
+    const BackgroundOrigin = 1 << 7;
+    const BackgroundClip(_vp) = 1 << 8;
+    const Background = Self::BackgroundColor.bits() | Self::BackgroundImage.bits() | Self::BackgroundPosition.bits() | Self::BackgroundRepeat.bits() | Self::BackgroundSize.bits() | Self::BackgroundAttachment.bits() | Self::BackgroundOrigin.bits() | Self::BackgroundClip.bits();
+  }
+}
+
 #[derive(Default)]
 pub(crate) struct BackgroundHandler<'i> {
-  targets: Option<Browsers>,
   color: Option<CssColor>,
   images: Option<SmallVec<[Image<'i>; 1]>>,
   has_prefix: bool,
@@ -768,16 +801,8 @@ pub(crate) struct BackgroundHandler<'i> {
   origins: Option<SmallVec<[BackgroundOrigin; 1]>>,
   clips: Option<SmallVec<[BackgroundClip; 1]>>,
   decls: Vec<Property<'i>>,
+  flushed_properties: BackgroundProperty,
   has_any: bool,
-}
-
-impl<'i> BackgroundHandler<'i> {
-  pub fn new(targets: Option<Browsers>) -> Self {
-    BackgroundHandler {
-      targets,
-      ..BackgroundHandler::default()
-    }
-  }
 }
 
 impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
@@ -789,24 +814,32 @@ impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
   ) -> bool {
     macro_rules! background_image {
       ($val: ident) => {
-        // If this is an image-set() and not all of our targets support it, preserve previous fallback.
-        if Image::should_preserve_fallbacks(&$val, self.images.as_ref(), self.targets) {
-          self.flush(dest);
-        }
+        flush!(images, $val);
 
         // Store prefixed properties. Clear if we hit an unprefixed property and we have
         // targets. In this case, the necessary prefixes will be generated.
         self.has_prefix = $val.iter().any(|x| x.has_vendor_prefix());
         if self.has_prefix {
           self.decls.push(property.clone())
-        } else if self.targets.is_some() {
+        } else if context.targets.browsers.is_some() {
           self.decls.clear();
         }
       };
     }
 
+    macro_rules! flush {
+      ($key: ident, $val: expr) => {{
+        if self.$key.is_some() && matches!(context.targets.browsers, Some(targets) if !$val.is_compatible(targets)) {
+          self.flush(dest, context);
+        }
+      }};
+    }
+
     match &property {
-      Property::BackgroundColor(val) => self.color = Some(val.clone()),
+      Property::BackgroundColor(val) => {
+        flush!(color, val);
+        self.color = Some(val.clone());
+      }
       Property::BackgroundImage(val) => {
         background_image!(val);
         self.images = Some(val.clone())
@@ -825,14 +858,16 @@ impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
         if *vendor_prefix == VendorPrefix::None {
           self.clips = Some(val.clone());
         } else {
-          self.flush(dest);
+          self.flush(dest, context);
           dest.push(property.clone())
         }
       }
       Property::Background(val) => {
         let images: SmallVec<[Image; 1]> = val.iter().map(|b| b.image.clone()).collect();
         background_image!(images);
-        self.color = Some(val.last().unwrap().color.clone());
+        let color = val.last().unwrap().color.clone();
+        flush!(color, color);
+        self.color = Some(color);
         self.images = Some(images);
         self.x_positions = Some(val.iter().map(|b| b.position.x.clone()).collect());
         self.y_positions = Some(val.iter().map(|b| b.position.y.clone()).collect());
@@ -843,10 +878,13 @@ impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
         self.clips = Some(val.iter().map(|b| b.clip.clone()).collect());
       }
       Property::Unparsed(val) if is_background_property(&val.property_id) => {
-        self.flush(dest);
+        self.flush(dest, context);
         let mut unparsed = val.clone();
         context.add_unparsed_fallbacks(&mut unparsed);
-        dest.push(Property::Unparsed(unparsed))
+        self
+          .flushed_properties
+          .insert(BackgroundProperty::try_from(&unparsed.property_id).unwrap());
+        dest.push(Property::Unparsed(unparsed));
       }
       _ => return false,
     }
@@ -855,7 +893,7 @@ impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
     true
   }
 
-  fn finalize(&mut self, dest: &mut DeclarationList<'i>, _: &mut PropertyHandlerContext<'i, '_>) {
+  fn finalize(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
     // If the last declaration is prefixed, pop the last value
     // so it isn't duplicated when we flush.
     if self.has_prefix {
@@ -863,17 +901,25 @@ impl<'i> PropertyHandler<'i> for BackgroundHandler<'i> {
     }
 
     dest.extend(self.decls.drain(..));
-    self.flush(dest);
+    self.flush(dest, context);
+    self.flushed_properties = BackgroundProperty::empty();
   }
 }
 
 impl<'i> BackgroundHandler<'i> {
-  fn flush(&mut self, dest: &mut DeclarationList<'i>) {
+  fn flush(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
     if !self.has_any {
       return;
     }
 
     self.has_any = false;
+
+    macro_rules! push {
+      ($prop: ident, $val: expr) => {
+        dest.push(Property::$prop($val));
+        self.flushed_properties.insert(BackgroundProperty::$prop);
+      };
+    }
 
     let color = std::mem::take(&mut self.color);
     let mut images = std::mem::take(&mut self.images);
@@ -916,12 +962,8 @@ impl<'i> BackgroundHandler<'i> {
         && origins.len() == len
         && clips.len() == len
       {
-        let clip_prefixes = if let Some(targets) = self.targets {
-          if clips.iter().any(|clip| *clip == BackgroundClip::Text) {
-            Feature::BackgroundClip.prefixes_for(targets)
-          } else {
-            VendorPrefix::None
-          }
+        let clip_prefixes = if clips.iter().any(|clip| *clip == BackgroundClip::Text) {
+          context.targets.prefixes(VendorPrefix::None, Feature::BackgroundClip)
         } else {
           VendorPrefix::None
         };
@@ -968,16 +1010,17 @@ impl<'i> BackgroundHandler<'i> {
         )
         .collect();
 
-        if let Some(targets) = self.targets {
-          for fallback in backgrounds.get_fallbacks(targets) {
-            dest.push(Property::Background(fallback));
+        if !self.flushed_properties.intersects(BackgroundProperty::Background) {
+          for fallback in backgrounds.get_fallbacks(context.targets) {
+            push!(Background, fallback);
           }
         }
 
-        dest.push(Property::Background(backgrounds));
+        push!(Background, backgrounds);
 
         if let Some(clip) = clip_property {
-          dest.push(clip)
+          dest.push(clip);
+          self.flushed_properties.insert(BackgroundProperty::BackgroundClip);
         }
 
         self.reset();
@@ -986,23 +1029,23 @@ impl<'i> BackgroundHandler<'i> {
     }
 
     if let Some(mut color) = color {
-      if let Some(targets) = self.targets {
-        for fallback in color.get_fallbacks(targets) {
-          dest.push(Property::BackgroundColor(fallback))
+      if !self.flushed_properties.contains(BackgroundProperty::BackgroundColor) {
+        for fallback in color.get_fallbacks(context.targets) {
+          push!(BackgroundColor, fallback);
         }
       }
 
-      dest.push(Property::BackgroundColor(color))
+      push!(BackgroundColor, color);
     }
 
     if let Some(mut images) = images {
-      if let Some(targets) = self.targets {
-        for fallback in images.get_fallbacks(targets) {
-          dest.push(Property::BackgroundImage(fallback));
+      if !self.flushed_properties.contains(BackgroundProperty::BackgroundImage) {
+        for fallback in images.get_fallbacks(context.targets) {
+          push!(BackgroundImage, fallback);
         }
       }
 
-      dest.push(Property::BackgroundImage(images))
+      push!(BackgroundImage, images);
     }
 
     match (&mut x_positions, &mut y_positions) {
@@ -1010,46 +1053,43 @@ impl<'i> BackgroundHandler<'i> {
         let positions = izip!(x_positions.drain(..), y_positions.drain(..))
           .map(|(x, y)| BackgroundPosition { x, y })
           .collect();
-        dest.push(Property::BackgroundPosition(positions))
+        push!(BackgroundPosition, positions);
       }
       _ => {
         if let Some(x_positions) = x_positions {
-          dest.push(Property::BackgroundPositionX(x_positions))
+          push!(BackgroundPositionX, x_positions);
         }
 
         if let Some(y_positions) = y_positions {
-          dest.push(Property::BackgroundPositionY(y_positions))
+          push!(BackgroundPositionY, y_positions);
         }
       }
     }
 
     if let Some(repeats) = repeats {
-      dest.push(Property::BackgroundRepeat(repeats))
+      push!(BackgroundRepeat, repeats);
     }
 
     if let Some(sizes) = sizes {
-      dest.push(Property::BackgroundSize(sizes))
+      push!(BackgroundSize, sizes);
     }
 
     if let Some(attachments) = attachments {
-      dest.push(Property::BackgroundAttachment(attachments))
+      push!(BackgroundAttachment, attachments);
     }
 
     if let Some(origins) = origins {
-      dest.push(Property::BackgroundOrigin(origins))
+      push!(BackgroundOrigin, origins);
     }
 
     if let Some(clips) = clips {
-      let prefixes = if let Some(targets) = self.targets {
-        if clips.iter().any(|clip| *clip == BackgroundClip::Text) {
-          Feature::BackgroundClip.prefixes_for(targets)
-        } else {
-          VendorPrefix::None
-        }
+      let prefixes = if clips.iter().any(|clip| *clip == BackgroundClip::Text) {
+        context.targets.prefixes(VendorPrefix::None, Feature::BackgroundClip)
       } else {
         VendorPrefix::None
       };
-      dest.push(Property::BackgroundClip(clips, prefixes))
+      dest.push(Property::BackgroundClip(clips, prefixes));
+      self.flushed_properties.insert(BackgroundProperty::BackgroundClip);
     }
 
     self.reset();

@@ -12,8 +12,8 @@ use crate::macros::enum_property;
 use crate::printer::Printer;
 use crate::properties::PropertyId;
 use crate::rules::supports::SupportsCondition;
-use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, ToCss};
+use crate::targets::{should_compile, Browsers, Targets};
+use crate::traits::{FallbackValues, IsCompatible, Parse, ToCss};
 #[cfg(feature = "visitor")]
 use crate::visitor::{Visit, VisitTypes, Visitor};
 use bitflags::bitflags;
@@ -189,6 +189,7 @@ pub enum FloatColor {
 
 bitflags! {
   /// A color type that is used as a fallback when compiling colors for older browsers.
+  #[derive(PartialEq, Eq, Clone, Copy)]
   pub struct ColorFallbackKind: u8 {
     /// An RGB color fallback.
     const RGB    = 0b01;
@@ -300,38 +301,42 @@ impl CssColor {
     P3::from(self).into()
   }
 
-  pub(crate) fn get_possible_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  pub(crate) fn get_possible_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     // Fallbacks occur in levels: Oklab -> Lab -> P3 -> RGB. We start with all levels
     // below and including the authored color space, and remove the ones that aren't
     // compatible with our browser targets.
     let mut fallbacks = match self {
       CssColor::CurrentColor | CssColor::RGBA(_) | CssColor::Float(..) => return ColorFallbackKind::empty(),
       CssColor::LAB(lab) => match &**lab {
-        LABColor::LAB(..) | LABColor::LCH(..) => ColorFallbackKind::LAB.and_below(),
-        LABColor::OKLAB(..) | LABColor::OKLCH(..) => ColorFallbackKind::OKLAB.and_below(),
-      },
-      CssColor::Predefined(predefined) => match &**predefined {
-        PredefinedColor::DisplayP3(..) => ColorFallbackKind::P3.and_below(),
-        _ => {
-          if Feature::ColorFunction.is_compatible(targets) {
-            return ColorFallbackKind::empty();
-          }
-
+        LABColor::LAB(..) | LABColor::LCH(..) if should_compile!(targets, LabColors) => {
           ColorFallbackKind::LAB.and_below()
         }
+        LABColor::OKLAB(..) | LABColor::OKLCH(..) if should_compile!(targets, OklabColors) => {
+          ColorFallbackKind::OKLAB.and_below()
+        }
+        _ => return ColorFallbackKind::empty(),
+      },
+      CssColor::Predefined(predefined) => match &**predefined {
+        PredefinedColor::DisplayP3(..) if should_compile!(targets, P3Colors) => ColorFallbackKind::P3.and_below(),
+        _ if should_compile!(targets, ColorFunction) => ColorFallbackKind::LAB.and_below(),
+        _ => return ColorFallbackKind::empty(),
       },
     };
 
     if fallbacks.contains(ColorFallbackKind::OKLAB) {
-      if Feature::OklabColors.is_compatible(targets) {
+      if !should_compile!(targets, OklabColors) {
         fallbacks.remove(ColorFallbackKind::LAB.and_below());
       }
     }
 
     if fallbacks.contains(ColorFallbackKind::LAB) {
-      if Feature::LabColors.is_compatible(targets) {
+      if !should_compile!(targets, LabColors) {
         fallbacks.remove(ColorFallbackKind::P3.and_below());
-      } else if Feature::LabColors.is_partially_compatible(targets) {
+      } else if targets
+        .browsers
+        .map(|targets| Feature::LabColors.is_partially_compatible(targets))
+        .unwrap_or(false)
+      {
         // We don't need P3 if Lab is supported by some of our targets.
         // No browser implements Lab but not P3.
         fallbacks.remove(ColorFallbackKind::P3);
@@ -339,9 +344,13 @@ impl CssColor {
     }
 
     if fallbacks.contains(ColorFallbackKind::P3) {
-      if Feature::P3Colors.is_compatible(targets) {
+      if !should_compile!(targets, P3Colors) {
         fallbacks.remove(ColorFallbackKind::RGB);
-      } else if fallbacks.highest() != ColorFallbackKind::P3 && !Feature::P3Colors.is_partially_compatible(targets)
+      } else if fallbacks.highest() != ColorFallbackKind::P3
+        && !targets
+          .browsers
+          .map(|targets| Feature::P3Colors.is_partially_compatible(targets))
+          .unwrap_or(false)
       {
         // Remove P3 if it isn't supported by any targets, and wasn't the
         // original authored color.
@@ -353,7 +362,7 @@ impl CssColor {
   }
 
   /// Returns the color fallback types needed for the given browser targets.
-  pub fn get_necessary_fallbacks(&self, targets: Browsers) -> ColorFallbackKind {
+  pub fn get_necessary_fallbacks(&self, targets: Targets) -> ColorFallbackKind {
     // Get the full set of possible fallbacks, and remove the highest one, which
     // will replace the original declaration. The remaining fallbacks need to be added.
     let fallbacks = self.get_possible_fallbacks(targets);
@@ -375,8 +384,24 @@ impl CssColor {
   }
 }
 
+impl IsCompatible for CssColor {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      CssColor::CurrentColor | CssColor::RGBA(_) | CssColor::Float(..) => true,
+      CssColor::LAB(lab) => match &**lab {
+        LABColor::LAB(..) | LABColor::LCH(..) => Feature::LabColors.is_compatible(browsers),
+        LABColor::OKLAB(..) | LABColor::OKLCH(..) => Feature::OklabColors.is_compatible(browsers),
+      },
+      CssColor::Predefined(predefined) => match &**predefined {
+        PredefinedColor::DisplayP3(..) => Feature::P3Colors.is_compatible(browsers),
+        _ => Feature::ColorFunction.is_compatible(browsers),
+      },
+    }
+  }
+}
+
 impl FallbackValues for CssColor {
-  fn get_fallbacks(&mut self, targets: Browsers) -> Vec<CssColor> {
+  fn get_fallbacks(&mut self, targets: Targets) -> Vec<CssColor> {
     let fallbacks = self.get_necessary_fallbacks(targets);
 
     let mut res = Vec::new();
@@ -444,32 +469,30 @@ impl ToCss for CssColor {
           }
         } else {
           // If the #rrggbbaa syntax is not supported by the browser targets, output rgba()
-          if let Some(targets) = dest.targets {
-            if !Feature::CssRrggbbaa.is_compatible(targets) {
-              // If the browser doesn't support `#rrggbbaa` color syntax, it is converted to `transparent` when compressed(minify = true).
-              // https://www.w3.org/TR/css-color-4/#transparent-black
-              if dest.minify && color.red == 0 && color.green == 0 && color.blue == 0 && color.alpha == 0 {
-                return dest.write_str("transparent");
-              } else {
-                dest.write_str("rgba(")?;
-                write!(dest, "{}", color.red)?;
-                dest.delim(',', false)?;
-                write!(dest, "{}", color.green)?;
-                dest.delim(',', false)?;
-                write!(dest, "{}", color.blue)?;
-                dest.delim(',', false)?;
+          if should_compile!(dest.targets, HexAlphaColors) {
+            // If the browser doesn't support `#rrggbbaa` color syntax, it is converted to `transparent` when compressed(minify = true).
+            // https://www.w3.org/TR/css-color-4/#transparent-black
+            if dest.minify && color.red == 0 && color.green == 0 && color.blue == 0 && color.alpha == 0 {
+              return dest.write_str("transparent");
+            } else {
+              dest.write_str("rgba(")?;
+              write!(dest, "{}", color.red)?;
+              dest.delim(',', false)?;
+              write!(dest, "{}", color.green)?;
+              dest.delim(',', false)?;
+              write!(dest, "{}", color.blue)?;
+              dest.delim(',', false)?;
 
-                // Try first with two decimal places, then with three.
-                let mut rounded_alpha = (color.alpha_f32() * 100.0).round() / 100.0;
-                let clamped = (rounded_alpha * 255.0).round().max(0.).min(255.0) as u8;
-                if clamped != color.alpha {
-                  rounded_alpha = (color.alpha_f32() * 1000.).round() / 1000.;
-                }
-
-                rounded_alpha.to_css(dest)?;
-                dest.write_char(')')?;
-                return Ok(());
+              // Try first with two decimal places, then with three.
+              let mut rounded_alpha = (color.alpha_f32() * 100.0).round() / 100.0;
+              let clamped = (rounded_alpha * 255.0).round().max(0.).min(255.0) as u8;
+              if clamped != color.alpha {
+                rounded_alpha = (color.alpha_f32() * 1000.).round() / 1000.;
               }
+
+              rounded_alpha.to_css(dest)?;
+              dest.write_char(')')?;
+              return Ok(());
             }
           }
 
@@ -487,8 +510,8 @@ impl ToCss for CssColor {
         Ok(())
       }
       CssColor::LAB(lab) => match &**lab {
-        LABColor::LAB(lab) => write_components("lab", lab.l / 100.0, lab.a, lab.b, lab.alpha, dest),
-        LABColor::LCH(lch) => write_components("lch", lch.l / 100.0, lch.c, lch.h, lch.alpha, dest),
+        LABColor::LAB(lab) => write_components("lab", lab.l, lab.a, lab.b, lab.alpha, dest),
+        LABColor::LCH(lch) => write_components("lch", lch.l, lch.c, lch.h, lch.alpha, dest),
         LABColor::OKLAB(lab) => write_components("oklab", lab.l, lab.a, lab.b, lab.alpha, dest),
         LABColor::OKLCH(lch) => write_components("oklch", lch.l, lch.c, lch.h, lch.alpha, dest),
       },
@@ -826,22 +849,22 @@ fn parse_color_function<'i, 't>(input: &mut Parser<'i, 't>) -> Result<CssColor, 
 
   match_ignore_ascii_case! {&*function,
     "lab" => {
-      let (l, a, b, alpha) = parse_lab::<LAB>(input, &mut parser, 100.0, 125.0)?;
+      let (l, a, b, alpha) = parse_lab::<LAB>(input, &mut parser)?;
       let lab = LABColor::LAB(LAB { l, a, b, alpha });
       Ok(CssColor::LAB(Box::new(lab)))
     },
     "oklab" => {
-      let (l, a, b, alpha) = parse_lab::<OKLAB>(input, &mut parser, 1.0, 0.4)?;
+      let (l, a, b, alpha) = parse_lab::<OKLAB>(input, &mut parser)?;
       let lab = LABColor::OKLAB(OKLAB { l, a, b, alpha });
       Ok(CssColor::LAB(Box::new(lab)))
     },
     "lch" => {
-      let (l, c, h, alpha) = parse_lch::<LCH>(input, &mut parser, 100.0, 150.0)?;
+      let (l, c, h, alpha) = parse_lch::<LCH>(input, &mut parser)?;
       let lab = LABColor::LCH(LCH { l, c, h, alpha });
       Ok(CssColor::LAB(Box::new(lab)))
     },
     "oklch" => {
-      let (l, c, h, alpha) = parse_lch::<OKLCH>(input, &mut parser, 1.0, 0.4)?;
+      let (l, c, h, alpha) = parse_lch::<OKLCH>(input, &mut parser)?;
       let lab = LABColor::OKLCH(OKLCH { l, c, h, alpha });
       Ok(CssColor::LAB(Box::new(lab)))
     },
@@ -875,17 +898,15 @@ fn parse_color_function<'i, 't>(input: &mut Parser<'i, 't>) -> Result<CssColor, 
 fn parse_lab<'i, 't, T: From<CssColor> + ColorSpace>(
   input: &mut Parser<'i, 't>,
   parser: &mut ComponentParser,
-  l_basis: f32,
-  ab_basis: f32,
 ) -> Result<(f32, f32, f32, f32), ParseError<'i, ParserError<'i>>> {
   // https://www.w3.org/TR/css-color-4/#funcdef-lab
   let res = input.parse_nested_block(|input| {
     parser.parse_relative::<T>(input)?;
 
     // f32::max() does not propagate NaN, so use clamp for now until f32::maximum() is stable.
-    let l = parse_number_or_percentage(input, parser, l_basis)?.clamp(0.0, f32::MAX);
-    let a = parse_number_or_percentage(input, parser, ab_basis)?;
-    let b = parse_number_or_percentage(input, parser, ab_basis)?;
+    let l = parser.parse_percentage(input)?.clamp(0.0, f32::MAX);
+    let a = parser.parse_number(input)?;
+    let b = parser.parse_number(input)?;
     let alpha = parse_alpha(input, parser)?;
 
     Ok((l, a, b, alpha))
@@ -899,8 +920,6 @@ fn parse_lab<'i, 't, T: From<CssColor> + ColorSpace>(
 fn parse_lch<'i, 't, T: From<CssColor> + ColorSpace>(
   input: &mut Parser<'i, 't>,
   parser: &mut ComponentParser,
-  l_basis: f32,
-  c_basis: f32,
 ) -> Result<(f32, f32, f32, f32), ParseError<'i, ParserError<'i>>> {
   // https://www.w3.org/TR/css-color-4/#funcdef-lch
   let res = input.parse_nested_block(|input| {
@@ -914,8 +933,8 @@ fn parse_lch<'i, 't, T: From<CssColor> + ColorSpace>(
       }
     }
 
-    let l = parse_number_or_percentage(input, parser, l_basis)?.clamp(0.0, f32::MAX);
-    let c = parse_number_or_percentage(input, parser, c_basis)?.clamp(0.0, f32::MAX);
+    let l = parser.parse_percentage(input)?.clamp(0.0, f32::MAX);
+    let c = parser.parse_number(input)?.clamp(0.0, f32::MAX);
     let h = parse_angle_or_number(input, parser)?;
     let alpha = parse_alpha(input, parser)?;
 
@@ -960,13 +979,13 @@ fn parse_predefined<'i, 't>(
     // Out of gamut values should not be clamped, i.e. values < 0 or > 1 should be preserved.
     // The browser will gamut-map the color for the target device that it is rendered on.
     let a = input
-      .try_parse(|input| parse_number_or_percentage(input, parser, 1.0))
+      .try_parse(|input| parse_number_or_percentage(input, parser))
       .unwrap_or(0.0);
     let b = input
-      .try_parse(|input| parse_number_or_percentage(input, parser, 1.0))
+      .try_parse(|input| parse_number_or_percentage(input, parser))
       .unwrap_or(0.0);
     let c = input
-      .try_parse(|input| parse_number_or_percentage(input, parser, 1.0))
+      .try_parse(|input| parse_number_or_percentage(input, parser))
       .unwrap_or(0.0);
     let alpha = parse_alpha(input, parser)?;
 
@@ -1092,11 +1111,10 @@ fn parse_angle_or_number<'i, 't>(
 fn parse_number_or_percentage<'i, 't>(
   input: &mut Parser<'i, 't>,
   parser: &ComponentParser,
-  percent_basis: f32,
 ) -> Result<f32, ParseError<'i, ParserError<'i>>> {
   Ok(match parser.parse_number_or_percentage(input)? {
     NumberOrPercentage::Number { value } => value,
-    NumberOrPercentage::Percentage { unit_value } => unit_value * percent_basis,
+    NumberOrPercentage::Percentage { unit_value } => unit_value,
   })
 }
 
@@ -1106,7 +1124,7 @@ fn parse_alpha<'i, 't>(
   parser: &ComponentParser,
 ) -> Result<f32, ParseError<'i, ParserError<'i>>> {
   let res = if input.try_parse(|input| input.expect_delim('/')).is_ok() {
-    parse_number_or_percentage(input, parser, 1.0)?.clamp(0.0, 1.0)
+    parse_number_or_percentage(input, parser)?.clamp(0.0, 1.0)
   } else {
     1.0
   };
@@ -1130,7 +1148,6 @@ where
   if a.is_nan() {
     dest.write_str("none")?;
   } else {
-    // Safari 15 only supports percentages.
     Percentage(a).to_css(dest)?;
   }
   dest.write_char(' ')?;
@@ -1202,6 +1219,7 @@ where
 
 bitflags! {
   /// A channel type for a color space.
+  #[derive(PartialEq, Eq, Clone, Copy)]
   pub struct ChannelType: u8 {
     /// Channel represents a percentage.
     const Percentage = 0b001;
@@ -1585,7 +1603,7 @@ impl From<LAB> for XYZd50 {
     const E: f32 = 216.0 / 24389.0; // 6^3/29^3
 
     let lab = lab.resolve_missing();
-    let l = lab.l;
+    let l = lab.l * 100.0;
     let a = lab.a;
     let b = lab.b;
 
@@ -1844,7 +1862,7 @@ impl From<XYZd50> for LAB {
 
     let f2 = if z > E { z.cbrt() } else { (K * z + 16.0) / 116.0 };
 
-    let l = (116.0 * f1) - 16.0;
+    let l = ((116.0 * f1) - 16.0) / 100.0;
     let a = 500.0 * (f0 - f1);
     let b = 200.0 * (f1 - f2);
     LAB {

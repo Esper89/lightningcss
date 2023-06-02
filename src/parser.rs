@@ -3,7 +3,7 @@ use crate::error::{Error, ParserError, PrinterError};
 use crate::media_query::*;
 use crate::printer::Printer;
 use crate::properties::custom::TokenList;
-use crate::rules::container::{ContainerName, ContainerRule};
+use crate::rules::container::{ContainerCondition, ContainerName, ContainerRule};
 use crate::rules::font_palette_values::FontPaletteValuesRule;
 use crate::rules::layer::{LayerBlockRule, LayerStatementRule};
 use crate::rules::property::PropertyRule;
@@ -32,19 +32,29 @@ use crate::values::string::CowArcStr;
 use crate::vendor_prefix::VendorPrefix;
 #[cfg(feature = "visitor")]
 use crate::visitor::{Visit, VisitTypes, Visitor};
+use bitflags::bitflags;
 use cssparser::*;
 use parcel_selectors::parser::NestingRequirement;
 use std::sync::{Arc, RwLock};
+
+bitflags! {
+  /// Parser feature flags to enable.
+  #[derive(Clone, Debug, Default)]
+  pub struct ParserFlags: u8 {
+    /// Whether the enable the [CSS nesting](https://www.w3.org/TR/css-nesting-1/) draft syntax.
+    const NESTING = 1 << 0;
+    /// Whether to enable the [custom media](https://drafts.csswg.org/mediaqueries-5/#custom-mq) draft syntax.
+    const CUSTOM_MEDIA = 1 << 1;
+    /// Whether to enable the non-standard >>> and /deep/ selector combinators used by Vue and Angular.
+    const DEEP_SELECTOR_COMBINATOR = 1 << 2;
+  }
+}
 
 /// CSS parsing options.
 #[derive(Clone, Debug, Default)]
 pub struct ParserOptions<'o, 'i> {
   /// Filename to use in error messages.
   pub filename: String,
-  /// Whether the enable the [CSS nesting](https://www.w3.org/TR/css-nesting-1/) draft syntax.
-  pub nesting: bool,
-  /// Whether to enable the [custom media](https://drafts.csswg.org/mediaqueries-5/#custom-mq) draft syntax.
-  pub custom_media: bool,
   /// Whether the enable [CSS modules](https://github.com/css-modules/css-modules).
   pub css_modules: Option<crate::css_modules::Config<'o>>,
   /// The source index to assign to all parsed rules. Impacts the source map when
@@ -54,6 +64,8 @@ pub struct ParserOptions<'o, 'i> {
   pub error_recovery: bool,
   /// A list that will be appended to when a warning occurs.
   pub warnings: Option<Arc<RwLock<Vec<Error<ParserError<'i>>>>>>,
+  /// Feature flags to enable.
+  pub flags: ParserFlags,
 }
 
 impl<'o, 'i> ParserOptions<'o, 'i> {
@@ -177,7 +189,7 @@ pub enum AtRulePrelude<'i, T> {
   /// An @property prelude.
   Property(DashedIdent<'i>),
   /// A @container prelude.
-  Container(Option<ContainerName<'i>>, MediaCondition<'i>),
+  Container(Option<ContainerName<'i>>, ContainerCondition<'i>),
   /// An unknown prelude.
   Unknown(CowArcStr<'i>, TokenList<'i>),
   /// A custom prelude.
@@ -238,7 +250,7 @@ impl<'a, 'o, 'i, T: crate::traits::AtRuleParser<'i>> AtRuleParser<'i> for TopLev
         input.expect_string()?;
         return Ok(AtRulePrelude::Charset)
       },
-      "custom-media" if self.options.custom_media => {
+      "custom-media" if self.options.flags.contains(ParserFlags::CUSTOM_MEDIA) => {
         let name = DashedIdent::parse(input)?;
         let media = MediaList::parse(input)?;
         return Ok(AtRulePrelude::CustomMedia(name, media))
@@ -497,7 +509,7 @@ impl<'a, 'o, 'b, 'i, T: crate::traits::AtRuleParser<'i>> AtRuleParser<'i> for Ne
       },
       "container" => {
         let name = input.try_parse(ContainerName::parse).ok();
-        let condition = MediaCondition::parse(input, true)?;
+        let condition = ContainerCondition::parse(input)?;
         Ok(AtRulePrelude::Container(name, condition))
       },
       _ => parse_custom_at_rule_prelude(&name, input, self.options, self.at_rule_parser)
@@ -667,7 +679,7 @@ impl<'a, 'o, 'b, 'i, T: crate::traits::AtRuleParser<'i>> QualifiedRuleParser<'i>
     input: &mut Parser<'i, 't>,
   ) -> Result<Self::Prelude, ParseError<'i, Self::Error>> {
     let selector_parser = SelectorParser {
-      is_nesting_allowed: self.options.nesting,
+      is_nesting_allowed: self.options.flags.contains(ParserFlags::NESTING),
       options: &self.options,
     };
     SelectorList::parse(&selector_parser, input, NestingRequirement::None)
@@ -680,7 +692,7 @@ impl<'a, 'o, 'b, 'i, T: crate::traits::AtRuleParser<'i>> QualifiedRuleParser<'i>
     input: &mut Parser<'i, 't>,
   ) -> Result<CssRule<'i, T::AtRule>, ParseError<'i, Self::Error>> {
     let loc = self.loc(start);
-    let (declarations, rules) = if self.options.nesting {
+    let (declarations, rules) = if self.options.flags.contains(ParserFlags::NESTING) {
       parse_declarations_and_nested_rules(input, self.options, self.at_rule_parser)?
     } else {
       (DeclarationBlock::parse(input, self.options)?, CssRuleList(vec![]))
@@ -863,7 +875,7 @@ impl<'a, 'o, 'i, T: crate::traits::AtRuleParser<'i>> AtRuleParser<'i> for StyleR
       },
       "container" => {
         let name = input.try_parse(ContainerName::parse).ok();
-        let condition = MediaCondition::parse(input, true)?;
+        let condition = ContainerCondition::parse(input)?;
         Ok(AtRulePrelude::Container(name, condition))
       },
       "layer" => {
